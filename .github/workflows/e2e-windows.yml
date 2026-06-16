@@ -63,10 +63,6 @@ jobs:
         run: npm run tauri:build
         working-directory: apps/bootstrap-installer
         timeout-minutes: 10
-        env:
-          # Pin the installer to the exact commit being tested so that the
-          # install script checks out this PR/code rather than remote main.
-          HERMES_BUILD_PIN_COMMIT: ${{ github.sha }}
 
       # Only runs on cache miss. Pick the exe the Tauri build produced and
       # normalize its name so downstream jobs always know what to download.
