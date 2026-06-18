@@ -29,7 +29,7 @@ logPath := A_Args.Length >= 1 ? A_Args[1] : "ahk.log"
 
 
 
-ToolTip("Waiting for the Hermes installer window to appear...")
+ToolTip("Waiting for the installer window to appear...")
 winTitle := "Hermes"
 try {
     WinWait(winTitle, , 30)
@@ -37,9 +37,9 @@ try {
     FileAppend("ERROR: Hermes installer window did not appear within 30s`n", logPath)
     ExitApp(1)
 }
-ToolTip("Hermes window appeared. Sleeping for a few seconds.....")
+ToolTip("Installerindow appeared. Sleeping for a few seconds.....")
 
-Sleep(10000)
+Sleep(5000)
 
 WinGetPos(&x, &y, &w, &h, winTitle)
 FileAppend(Format("Window found at x={1} y={2} w={3} h={4}`n", x, y, w, h), logPath)
