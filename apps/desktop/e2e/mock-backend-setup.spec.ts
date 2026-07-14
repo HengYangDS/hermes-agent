@@ -27,9 +27,6 @@ let fixture: MockBackendFixture | null = null
 
 test.beforeAll(async () => {
   fixture = await setupMockBackend()
-  // Wait for the app to boot and the window to be ready. The composer may
-  // be visible behind the onboarding overlay, so this alone doesn't prove
-  // we're past the setup screen — the tests below check that explicitly.
   await waitForAppReady(fixture!, 120_000)
 })
 
@@ -46,9 +43,6 @@ test.describe('mock backend gets past setup screen', () => {
     // when the runtime check fails to find a working provider. With the mock
     // backend configured, the runtime check should pass and the overlay
     // returns null — this text should NOT be present in the DOM.
-    //
-    // We give a generous timeout because the runtime check runs after the
-    // gateway connects, which can take a few seconds after the window opens.
     await page.waitForFunction(
       () => {
         const text = document.body.textContent ?? ''
