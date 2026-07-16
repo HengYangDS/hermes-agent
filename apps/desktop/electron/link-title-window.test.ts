@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { test } from 'vitest'
 
 import {
+  configureLinkTitleSession,
   createLinkTitleWindow,
   guardLinkTitleSession,
   linkTitleWindowOptions,
@@ -80,6 +81,55 @@ test('guardLinkTitleSession cancels downloads triggered by the title-fetch windo
     }
   })
   assert.ok(cancelled)
+})
+
+test('configureLinkTitleSession installs the fixed SOCKS proxy before request guards', async () => {
+  const calls = []
+
+  const partitionSession = {
+    on: () => calls.push('download-guard'),
+    setProxy: async config => calls.push(['setProxy', config]),
+    webRequest: { onBeforeRequest: () => calls.push('request-guard') }
+  }
+
+  await configureLinkTitleSession(partitionSession, value => value, 'socks5://127.0.0.1:48123')
+
+  assert.deepEqual(calls, [
+    [
+      'setProxy',
+      {
+        mode: 'fixed_servers',
+        proxyBypassRules: '<-loopback>',
+        proxyRules: 'socks5://127.0.0.1:48123'
+      }
+    ],
+    'request-guard',
+    'download-guard'
+  ])
+})
+
+test('configureLinkTitleSession fails before installing guards when proxy setup fails', async () => {
+  let guarded = false
+
+  const partitionSession = {
+    on: () => {
+      guarded = true
+    },
+    setProxy: async () => {
+      throw new Error('proxy unavailable')
+    },
+    webRequest: {
+      onBeforeRequest: () => {
+        guarded = true
+      }
+    }
+  }
+
+  await assert.rejects(
+    configureLinkTitleSession(partitionSession, value => value, 'socks5://127.0.0.1:48123'),
+    /proxy unavailable/
+  )
+  assert.equal(guarded, false)
 })
 
 test('guardLinkTitleSession blocks rejected redirects and subrequests while allowing public HTTP(S)', () => {

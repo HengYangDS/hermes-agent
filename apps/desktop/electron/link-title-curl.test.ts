@@ -13,6 +13,7 @@ import {
   linkTitleCurlRequestArgs,
   parseLinkTitleCurlHeaders
 } from './link-title-curl'
+import { startLinkTitleSocksGateway } from './link-title-socks'
 
 const execFileAsync = promisify(execFile)
 
@@ -30,6 +31,8 @@ test('curl request arguments never enable automatic redirect following', () => {
   const args = linkTitleCurlRequestArgs('https://example.com/', {
     connectTimeoutSeconds: 4,
     headerPath: 'C:\\Temp\\hermes-link-title.headers',
+    maxBytes: 98_304,
+    proxyUrl: 'socks5://127.0.0.1:48123',
     timeoutSeconds: 5,
     userAgent: 'Hermes test'
   })
@@ -38,6 +41,15 @@ test('curl request arguments never enable automatic redirect following', () => {
   assert.equal(args.includes('--no-location'), true)
   assert.equal(args.includes('--location'), false)
   assert.equal(args.includes('--max-redirs'), false)
+  assert.deepEqual(args.slice(args.indexOf('--proxy'), args.indexOf('--proxy') + 2), [
+    '--proxy',
+    'socks5h://127.0.0.1:48123'
+  ])
+  assert.deepEqual(args.slice(args.indexOf('--noproxy'), args.indexOf('--noproxy') + 2), ['--noproxy', ''])
+  assert.deepEqual(args.slice(args.indexOf('--max-filesize'), args.indexOf('--max-filesize') + 2), [
+    '--max-filesize',
+    '98304'
+  ])
   assert.deepEqual(args.slice(args.indexOf('--dump-header'), args.indexOf('--dump-header') + 2), [
     '--dump-header',
     'C:\\Temp\\hermes-link-title.headers'
@@ -48,6 +60,7 @@ test('curl ignores a default config that enables automatic redirects', async () 
   const curlHome = await fs.mkdtemp(path.join(os.tmpdir(), 'hermes-link-title-curlrc-'))
   const headerPath = path.join(curlHome, 'headers')
   let redirectedRequests = 0
+  let gateway
 
   const server = http.createServer((request, response) => {
     if (request.url === '/start') {
@@ -73,10 +86,16 @@ test('curl ignores a default config that enables automatic redirects', async () 
     const address = server.address()
 
     assert.ok(address && typeof address !== 'string')
+    gateway = await startLinkTitleSocksGateway({
+      connectTimeoutMs: 1_000,
+      resolve: async () => [{ address: '127.0.0.1', family: 4 }]
+    })
 
     const args = linkTitleCurlRequestArgs(`http://127.0.0.1:${address.port}/start`, {
       connectTimeoutSeconds: 2,
       headerPath,
+      maxBytes: 98_304,
+      proxyUrl: gateway.proxyUrl,
       timeoutSeconds: 2,
       userAgent: 'Hermes test'
     })
@@ -88,6 +107,7 @@ test('curl ignores a default config that enables automatic redirects', async () 
     })
     assert.equal(redirectedRequests, 0)
   } finally {
+    await gateway?.close()
     await new Promise<void>(resolve => server.close(() => resolve()))
     await fs.rm(curlHome, { force: true, recursive: true })
   }

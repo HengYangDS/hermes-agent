@@ -108,8 +108,18 @@ import {
   linkTitleCurlRequestArgs,
   parseLinkTitleCurlHeaders
 } from './link-title-curl'
+import { createLinkTitlePinnedResolver } from './link-title-dns'
 import { createLinkTitleFetcher } from './link-title-fetch'
-import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
+import {
+  createLinkTitleSocksGatewayController,
+  startLinkTitleSocksGateway
+} from './link-title-socks'
+import {
+  configureLinkTitleSession,
+  createLinkTitleWindow,
+  guardLinkTitleSession,
+  readLinkTitleWindowTitle
+} from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
 import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
 import { decideProfileDeleteAction, profileNameFromDeleteRequest, resolveRouteProfile } from './profile-delete-routing'
@@ -4017,8 +4027,9 @@ function filenameFromUrl(rawUrl, fallback = 'image') {
 // Link title resolution — curl (tier 1) → hidden BrowserWindow (tier 2).
 // Use bundle-time require here so the Electron composite project does not pull
 // the shared workspace's source tree under its own rootDir.
-const { admitLinkTitleUrl } = require('@hermes/shared') as {
+const { admitLinkTitleUrl, isPublicLinkTitleAddress } = require('@hermes/shared') as {
   admitLinkTitleUrl: (value: string) => null | string
+  isPublicLinkTitleAddress: (value: string) => boolean
 }
 
 const titleCache = new Map()
@@ -4027,6 +4038,8 @@ const TITLE_CACHE_LIMIT = 500
 const TITLE_BYTE_BUDGET = 96 * 1024
 const TITLE_TIMEOUT_MS = 5000
 const TITLE_MAX_REDIRECTS = 3
+const TITLE_DNS_PIN_TTL_MS = 30_000
+const TITLE_CONNECT_TIMEOUT_MS = 4_000
 
 // Browser-shaped UA — many bot-walled sites (GetYourGuide, Cloudflare-protected
 // pages) refuse anything that doesn't look like a real Chrome.
@@ -4045,9 +4058,24 @@ const RENDER_TITLE_TIMEOUT_MS = 8000
 const RENDER_TITLE_GRACE_MS = 700
 
 let linkTitleSession = null
+let linkTitleSessionPending = null
 let oauthSession = null
 let renderTitleInFlight = 0
 const renderTitleQueue = []
+
+const linkTitleResolver = createLinkTitlePinnedResolver({
+  isPublicAddress: isPublicLinkTitleAddress,
+  ttlMs: TITLE_DNS_PIN_TTL_MS
+})
+
+const linkTitleGatewayController = createLinkTitleSocksGatewayController({
+  clearPins: linkTitleResolver.clear,
+  start: () =>
+    startLinkTitleSocksGateway({
+      connectTimeoutMs: TITLE_CONNECT_TIMEOUT_MS,
+      resolve: linkTitleResolver.resolve
+    })
+})
 
 function canonicalTitleCacheKey(rawUrl) {
   const value = String(rawUrl || '').trim()
@@ -4088,7 +4116,17 @@ function parseHtmlTitle(html) {
   return raw ? decodeHtmlEntities(raw).replace(/\s+/g, ' ').trim() : ''
 }
 
-function requestHtmlTitleWithCurl(url: string, timeoutMs: number): Promise<LinkTitleCurlHop> {
+async function requestHtmlTitleWithCurl(url: string, timeoutMs: number): Promise<LinkTitleCurlHop> {
+  let gateway
+
+  try {
+    gateway = await linkTitleGatewayController.get()
+  } catch {
+    // The pinned transport is mandatory. Networks that require a system proxy
+    // may return no preview rather than delegating DNS or connecting directly.
+    return { body: '', location: null, statusCode: 0 }
+  }
+
   return new Promise(resolve => {
     const timeoutSeconds = Math.max(0.1, timeoutMs / 1000)
 
@@ -4100,6 +4138,8 @@ function requestHtmlTitleWithCurl(url: string, timeoutMs: number): Promise<LinkT
     const args = linkTitleCurlRequestArgs(url, {
       connectTimeoutSeconds: Math.min(4, timeoutSeconds),
       headerPath,
+      maxBytes: TITLE_BYTE_BUDGET,
+      proxyUrl: gateway.proxyUrl,
       timeoutSeconds,
       userAgent: TITLE_USER_AGENT
     })
@@ -4149,22 +4189,33 @@ const fetchHtmlTitleWithCurl = createLinkTitleCurlFetcher({
   timeoutMs: TITLE_TIMEOUT_MS
 })
 
-function getLinkTitleSession() {
+async function getLinkTitleSession() {
   if (linkTitleSession || !app.isReady()) {
     return linkTitleSession
   }
 
-  const candidate = session.fromPartition('hermes:link-titles', { cache: false })
-
-  try {
-    guardLinkTitleSession(candidate, admitLinkTitleUrl)
-  } catch {
-    return null
+  if (linkTitleSessionPending) {
+    return linkTitleSessionPending
   }
 
-  linkTitleSession = candidate
+  const pending = (async () => {
+    const gateway = await linkTitleGatewayController.get()
+    const candidate = session.fromPartition('hermes:link-titles', { cache: false })
+    await configureLinkTitleSession(candidate, admitLinkTitleUrl, gateway.proxyUrl)
+    linkTitleSession = candidate
 
-  return linkTitleSession
+    return candidate
+  })()
+    .catch(() => null)
+    .finally(() => {
+      if (linkTitleSessionPending === pending) {
+        linkTitleSessionPending = null
+      }
+    })
+
+  linkTitleSessionPending = pending
+
+  return pending
 }
 
 function dequeueRenderTitle() {
@@ -4179,23 +4230,24 @@ function dequeueRenderTitle() {
   }
 }
 
-function runRenderTitleJob(rawUrl) {
+async function runRenderTitleJob(rawUrl) {
+  const url = admitLinkTitleUrl(rawUrl)
+
+  if (!url) {
+    return ''
+  }
+
+  if (!app.isReady()) {
+    return ''
+  }
+
+  const partitionSession = await getLinkTitleSession()
+
+  if (!partitionSession) {
+    return ''
+  }
+
   return new Promise(resolve => {
-    const url = admitLinkTitleUrl(rawUrl)
-
-    if (!url) {
-      return resolve('')
-    }
-
-    if (!app.isReady()) {
-      return resolve('')
-    }
-
-    const partitionSession = getLinkTitleSession()
-
-    if (!partitionSession) {
-      return resolve('')
-    }
 
     let settled = false
     let window = null
@@ -9484,6 +9536,10 @@ app.on('before-quit', () => {
       void 0
     }
   }
+
+  linkTitleSession = null
+  linkTitleSessionPending = null
+  void linkTitleGatewayController.close()
 
   // The always-on-top overlay isn't a "real" app window; close it so a stray
   // pet can't keep the process alive or float over a quit app.

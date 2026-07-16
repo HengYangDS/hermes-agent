@@ -18,14 +18,24 @@ export interface LinkTitleCurlDependencies {
 export interface LinkTitleCurlRequestOptions {
   connectTimeoutSeconds: number
   headerPath: string
+  maxBytes: number
+  proxyUrl: string
   timeoutSeconds: number
   userAgent: string
+}
+
+function curlSocksProxyUrl(proxyUrl: string): string {
+  return proxyUrl.replace(/^socks5:/, 'socks5h:')
 }
 
 export function linkTitleCurlRequestArgs(url: string, options: LinkTitleCurlRequestOptions): string[] {
   return [
     '--disable',
     '--no-location',
+    '--proxy',
+    curlSocksProxyUrl(options.proxyUrl),
+    '--noproxy',
+    '',
     '--silent',
     '--show-error',
     '--max-time',
@@ -42,6 +52,8 @@ export function linkTitleCurlRequestArgs(url: string, options: LinkTitleCurlRequ
     'Accept-Encoding: identity',
     '--proto',
     '=http,https',
+    '--max-filesize',
+    String(options.maxBytes),
     '--dump-header',
     options.headerPath,
     '--raw',
