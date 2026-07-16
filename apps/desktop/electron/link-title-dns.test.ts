@@ -62,7 +62,7 @@ test('rejects empty, private-only, and mixed DNS answers without caching them', 
   ])
 })
 
-test('pins concurrent and later calls until TTL expiry, then re-resolves and rejects rebinding', async () => {
+test('renews an active pin for a full TTL so a near-expiry fetch cannot rebind mid-flight', async () => {
   let now = 100
   let finishFirstLookup: ((value: readonly LinkTitleAddress[]) => void) | undefined
 
@@ -88,12 +88,66 @@ test('pins concurrent and later calls until TTL expiry, then re-resolves and rej
   assert.deepEqual(await resolver.resolve('rebind.example'), [address(PUBLIC_V4, 4)])
   assert.equal(lookup.mock.calls.length, 1)
 
-  now += 1
+  now += 20_000
+  assert.deepEqual(await resolver.resolve('rebind.example'), [address(PUBLIC_V4, 4)])
+  assert.equal(lookup.mock.calls.length, 1)
+
+  now += 30_001
   await assert.rejects(resolver.resolve('rebind.example'), /non-public/i)
   assert.equal(lookup.mock.calls.length, 2)
 
   assert.deepEqual(await resolver.resolve('rebind.example'), [address(PUBLIC_V6, 6)])
   assert.equal(lookup.mock.calls.length, 3)
+})
+
+test('bounds one-shot hostname pins and evicts the least recently used entry', async () => {
+  let now = 0
+  const lookup = vi.fn(async () => [address(PUBLIC_V4, 4)])
+
+  const resolver = createLinkTitlePinnedResolver({
+    isPublicAddress,
+    lookup,
+    maxEntries: 2,
+    now: () => now,
+    ttlMs: 30_000
+  })
+
+  await resolver.resolve('one.example')
+  now += 1
+  await resolver.resolve('two.example')
+  now += 1
+  await resolver.resolve('one.example')
+  now += 1
+  await resolver.resolve('three.example')
+  now += 1
+  await resolver.resolve('two.example')
+
+  assert.deepEqual(lookup.mock.calls, [
+    ['one.example'],
+    ['two.example'],
+    ['three.example'],
+    ['two.example']
+  ])
+})
+
+test('prunes expired one-shot pins before admitting new hostnames', async () => {
+  let now = 0
+  const lookup = vi.fn(async () => [address(PUBLIC_V4, 4)])
+
+  const resolver = createLinkTitlePinnedResolver({
+    isPublicAddress,
+    lookup,
+    maxEntries: 2,
+    now: () => now,
+    ttlMs: 10
+  })
+
+  await resolver.resolve('expired.example')
+  now = 11
+  await resolver.resolve('fresh.example')
+  await resolver.resolve('expired.example')
+
+  assert.deepEqual(lookup.mock.calls, [['expired.example'], ['fresh.example'], ['expired.example']])
 })
 
 test('clear invalidates approved pins immediately', async () => {

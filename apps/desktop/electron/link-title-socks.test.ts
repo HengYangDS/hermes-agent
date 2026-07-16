@@ -96,6 +96,21 @@ test('gateway rejects unknown address types and oversized handshakes', async () 
   }
 })
 
+test('gateway returns the SOCKS greeting rejection shape when no supported auth method is offered', async () => {
+  const resolve = vi.fn(async () => [{ address: '93.184.216.34', family: 4 as const }])
+  const gateway = await startLinkTitleSocksGateway({ connectTimeoutMs: 250, resolve })
+
+  try {
+    const socket = await connectToGateway(gateway.proxyUrl)
+    socket.write(Buffer.from([0x05, 0x01, 0x02]))
+    assert.deepEqual(await readAtLeast(socket, 2), Buffer.from([0x05, 0xff]))
+    assert.equal(resolve.mock.calls.length, 0)
+    socket.destroy()
+  } finally {
+    await gateway.close()
+  }
+})
+
 test('resolver rejection never reaches the upstream connector', async () => {
   const resolve = vi.fn(async () => {
     throw new Error('mixed or private DNS answer')
@@ -119,6 +134,92 @@ test('resolver rejection never reaches the upstream connector', async () => {
     assert.deepEqual(resolve.mock.calls, [['mixed.example']])
     assert.equal(createConnection.mock.calls.length, 0)
     socket.destroy()
+  } finally {
+    await gateway.close()
+  }
+})
+
+test('a timed-out client cannot start an upstream connection after slow DNS eventually resolves', async () => {
+  let finishResolve: ((value: readonly { address: string; family: 4 }[]) => void) | undefined
+
+  const pendingResolve = new Promise<readonly { address: string; family: 4 }[]>(resolve => {
+    finishResolve = resolve
+  })
+
+  const createConnection = vi.fn()
+
+  const gateway = await startLinkTitleSocksGateway({
+    connectTimeoutMs: 40,
+    createConnection: createConnection as unknown as typeof net.createConnection,
+    resolve: () => pendingResolve
+  })
+
+  try {
+    const socket = await connectToGateway(gateway.proxyUrl)
+    await negotiateNoAuth(socket)
+    socket.write(domainRequest(0x01, 'slow.example'))
+    await once(socket, 'close')
+
+    finishResolve?.([{ address: '93.184.216.34', family: 4 }])
+    await new Promise(resolve => setTimeout(resolve, 20))
+
+    assert.equal(createConnection.mock.calls.length, 0)
+  } finally {
+    await gateway.close()
+  }
+})
+
+test('gateway close destroys an upstream socket that is still connecting', async () => {
+  const stalled = new net.Socket()
+  const createConnection = vi.fn(() => stalled)
+
+  const gateway = await startLinkTitleSocksGateway({
+    connectTimeoutMs: 5_000,
+    createConnection: createConnection as unknown as typeof net.createConnection,
+    resolve: async () => [{ address: '93.184.216.34', family: 4 }]
+  })
+
+  const client = await connectToGateway(gateway.proxyUrl)
+  await negotiateNoAuth(client)
+  client.write(domainRequest(0x01, 'pending.example'))
+
+  for (let attempt = 0; attempt < 20 && createConnection.mock.calls.length === 0; attempt += 1) {
+    await new Promise(resolve => setTimeout(resolve, 5))
+  }
+
+  assert.equal(createConnection.mock.calls.length, 1)
+  await gateway.close()
+  assert.equal(stalled.destroyed, true)
+  client.destroy()
+})
+
+test('all approved addresses share one absolute connection deadline', async () => {
+  const sockets: net.Socket[] = []
+
+  const createConnection = vi.fn(() => {
+    const socket = new net.Socket()
+    sockets.push(socket)
+
+    return socket
+  })
+
+  const gateway = await startLinkTitleSocksGateway({
+    connectTimeoutMs: 40,
+    createConnection: createConnection as unknown as typeof net.createConnection,
+    resolve: async () => [
+      { address: '93.184.216.34', family: 4 },
+      { address: '2606:4700:4700::1111', family: 6 }
+    ]
+  })
+
+  try {
+    const client = await connectToGateway(gateway.proxyUrl)
+    await negotiateNoAuth(client)
+    client.write(domainRequest(0x01, 'deadline.example'))
+    await once(client, 'close')
+
+    assert.equal(createConnection.mock.calls.length, 1)
+    assert.equal(sockets.every(socket => socket.destroyed), true)
   } finally {
     await gateway.close()
   }

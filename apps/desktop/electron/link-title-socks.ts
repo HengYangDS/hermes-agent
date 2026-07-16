@@ -50,7 +50,6 @@ export function createLinkTitleSocksGatewayController(options: {
 }
 
 const MAX_HANDSHAKE_BYTES = 1_024
-const SOCKS_REPLY_SIZE = 10
 
 function reply(code: number): Buffer {
   return Buffer.from([0x05, code, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
@@ -66,40 +65,137 @@ function ipv6FromBytes(value: Buffer): string {
   return words.join(':')
 }
 
+function abortError(): Error {
+  return new Error('Link title SOCKS operation was aborted')
+}
+
+function timeoutError(): Error {
+  return new Error('Link title SOCKS operation timed out')
+}
+
+function awaitWithin<T>(operation: PromiseLike<T>, signal: AbortSignal, deadline: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    if (signal.aborted) {
+      reject(abortError())
+
+      return
+    }
+
+    const remainingMs = deadline - Date.now()
+
+    if (remainingMs <= 0) {
+      reject(timeoutError())
+
+      return
+    }
+
+    let settled = false
+
+    const cleanup = () => {
+      clearTimeout(timer)
+      signal.removeEventListener('abort', onAbort)
+    }
+
+    const finish = (callback: () => void) => {
+      if (settled) {
+        return
+      }
+
+      settled = true
+      cleanup()
+      callback()
+    }
+
+    const onAbort = () => finish(() => reject(abortError()))
+    const timer = setTimeout(() => finish(() => reject(timeoutError())), remainingMs)
+
+    signal.addEventListener('abort', onAbort, { once: true })
+    Promise.resolve(operation).then(
+      value => finish(() => resolve(value)),
+      error => finish(() => reject(error))
+    )
+  })
+}
+
 async function connectToApprovedAddress(
   addresses: readonly LinkTitleAddress[],
   port: number,
-  connectTimeoutMs: number,
-  createConnection: typeof net.createConnection
+  deadline: number,
+  signal: AbortSignal,
+  createConnection: typeof net.createConnection,
+  peers: Set<Socket>
 ): Promise<Socket> {
   let lastError: unknown = new Error('Link title SOCKS resolver returned no approved addresses')
 
   for (const target of addresses) {
-    try {
-      const upstream = createConnection({ family: target.family, host: target.address, port })
+    if (signal.aborted || Date.now() >= deadline) {
+      throw signal.aborted ? abortError() : timeoutError()
+    }
 
+    let upstream: Socket
+
+    try {
+      upstream = createConnection({ family: target.family, host: target.address, port })
+    } catch (error) {
+      lastError = error
+
+      continue
+    }
+
+    peers.add(upstream)
+
+    try {
       await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(() => {
+        const remainingMs = deadline - Date.now()
+
+        if (remainingMs <= 0) {
+          peers.delete(upstream)
           upstream.destroy()
-          reject(new Error('Link title SOCKS upstream connection timed out'))
-        }, connectTimeoutMs)
+          reject(timeoutError())
+
+          return
+        }
+
+        let settled = false
 
         const cleanup = () => {
           clearTimeout(timer)
+          signal.removeEventListener('abort', onAbort)
+          upstream.off('close', onClose)
           upstream.off('connect', onConnect)
           upstream.off('error', onError)
         }
 
+        const fail = (error: Error) => {
+          if (settled) {
+            return
+          }
+
+          settled = true
+          cleanup()
+          peers.delete(upstream)
+          upstream.destroy()
+          reject(error)
+        }
+
+        const onAbort = () => fail(abortError())
+        const onClose = () => fail(new Error('Link title SOCKS upstream closed before connecting'))
+
         const onConnect = () => {
+          if (settled) {
+            return
+          }
+
+          settled = true
           cleanup()
           resolve()
         }
 
-        const onError = (error: Error) => {
-          cleanup()
-          reject(error)
-        }
+        const onError = (error: Error) => fail(error)
+        const timer = setTimeout(() => fail(timeoutError()), remainingMs)
 
+        signal.addEventListener('abort', onAbort, { once: true })
+        upstream.once('close', onClose)
         upstream.once('connect', onConnect)
         upstream.once('error', onError)
       })
@@ -120,17 +216,23 @@ function handleClient(
     connectTimeoutMs: number
     createConnection: typeof net.createConnection
   },
-  peers: Set<Socket>
+  peers: Set<Socket>,
+  controllers: Set<AbortController>,
+  tasks: Set<Promise<void>>
 ): void {
+  const controller = new AbortController()
+  const deadline = Date.now() + options.connectTimeoutMs
   let buffer = Buffer.alloc(0)
   let phase: 'greeting' | 'request' | 'connecting' | 'relay' | 'closed' = 'greeting'
   let processing = false
   let upstream: Socket | null = null
 
   peers.add(client)
+  controllers.add(controller)
 
   const handshakeTimer = setTimeout(() => {
     if (phase !== 'relay' && phase !== 'closed') {
+      controller.abort()
       phase = 'closed'
       client.destroy()
     }
@@ -141,6 +243,7 @@ function handleClient(
       return
     }
 
+    controller.abort()
     phase = 'closed'
     clearTimeout(handshakeTimer)
     client.end(reply(code))
@@ -148,20 +251,26 @@ function handleClient(
 
   const beginRelay = async (hostname: string, port: number, pending: Buffer) => {
     try {
-      const addresses = await options.resolve(hostname)
+      const addresses = await awaitWithin(options.resolve(hostname), controller.signal, deadline)
       upstream = await connectToApprovedAddress(
         addresses,
         port,
-        options.connectTimeoutMs,
-        options.createConnection
+        deadline,
+        controller.signal,
+        options.createConnection,
+        peers
       )
     } catch {
-      closeWithReply(0x04)
+      if (!controller.signal.aborted && phase !== 'closed' && !client.destroyed) {
+        closeWithReply(0x04)
+      } else {
+        client.destroy()
+      }
 
       return
     }
 
-    if (phase === 'closed' || client.destroyed) {
+    if (controller.signal.aborted || phase === 'closed' || client.destroyed) {
       upstream.destroy()
 
       return
@@ -169,7 +278,6 @@ function handleClient(
 
     phase = 'relay'
     clearTimeout(handshakeTimer)
-    peers.add(upstream)
 
     upstream.once('close', () => {
       peers.delete(upstream as Socket)
@@ -187,6 +295,11 @@ function handleClient(
     client.pipe(upstream)
     upstream.pipe(client)
     client.resume()
+  }
+
+  const startRelay = (hostname: string, port: number, pending: Buffer) => {
+    const task = beginRelay(hostname, port, pending).finally(() => tasks.delete(task))
+    tasks.add(task)
   }
 
   const processBuffer = () => {
@@ -207,6 +320,7 @@ function handleClient(
           const greetingLength = 2 + methodCount
 
           if (buffer[0] !== 0x05 || methodCount === 0 || greetingLength > MAX_HANDSHAKE_BYTES) {
+            controller.abort()
             phase = 'closed'
             clearTimeout(handshakeTimer)
             client.destroy()
@@ -222,6 +336,7 @@ function handleClient(
           buffer = buffer.subarray(greetingLength)
 
           if (!methods.includes(0x00)) {
+            controller.abort()
             phase = 'closed'
             clearTimeout(handshakeTimer)
             client.end(Buffer.from([0x05, 0xff]))
@@ -281,6 +396,7 @@ function handleClient(
         const requestLength = addressOffset + addressLength + 2
 
         if (requestLength > MAX_HANDSHAKE_BYTES) {
+          controller.abort()
           phase = 'closed'
           clearTimeout(handshakeTimer)
           client.destroy()
@@ -306,7 +422,7 @@ function handleClient(
         buffer = Buffer.alloc(0)
         phase = 'connecting'
         client.pause()
-        void beginRelay(hostname, port, pending)
+        startRelay(hostname, port, pending)
 
         return
       }
@@ -323,6 +439,7 @@ function handleClient(
     const next = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
 
     if (buffer.length + next.length > MAX_HANDSHAKE_BYTES) {
+      controller.abort()
       phase = 'closed'
       clearTimeout(handshakeTimer)
       client.destroy()
@@ -335,6 +452,8 @@ function handleClient(
   })
   client.once('close', () => {
     phase = 'closed'
+    controller.abort()
+    controllers.delete(controller)
     clearTimeout(handshakeTimer)
     peers.delete(client)
     upstream?.destroy()
@@ -347,23 +466,41 @@ export async function startLinkTitleSocksGateway(options: {
   connectTimeoutMs: number
   createConnection?: typeof net.createConnection
 }): Promise<LinkTitleSocksGateway> {
+  const controllers = new Set<AbortController>()
   const peers = new Set<Socket>()
+  const tasks = new Set<Promise<void>>()
   const createConnection = options.createConnection ?? net.createConnection
 
   const server = net.createServer(client =>
-    handleClient(client, { ...options, createConnection }, peers)
+    handleClient(client, { ...options, createConnection }, peers, controllers, tasks)
   )
 
   await new Promise<void>((resolve, reject) => {
-    const onError = (error: Error) => {
+    let settled = false
+
+    const cleanup = () => {
+      clearTimeout(timer)
+      server.off('error', onError)
       server.off('listening', onListening)
-      reject(error)
     }
 
-    const onListening = () => {
-      server.off('error', onError)
-      resolve()
+    const finish = (callback: () => void) => {
+      if (settled) {
+        return
+      }
+
+      settled = true
+      cleanup()
+      callback()
     }
+
+    const onError = (error: Error) => finish(() => reject(error))
+    const onListening = () => finish(resolve)
+
+    const timer = setTimeout(() => {
+      server.close()
+      finish(() => reject(new Error('Link title SOCKS gateway startup timed out')))
+    }, options.connectTimeoutMs)
 
     server.once('error', onError)
     server.once('listening', onListening)
@@ -377,25 +514,37 @@ export async function startLinkTitleSocksGateway(options: {
     throw new Error('Link title SOCKS gateway did not bind a TCP port')
   }
 
+  server.on('error', () => undefined)
   let closePromise: Promise<void> | null = null
 
   return {
     async close() {
       if (!closePromise) {
-        closePromise = new Promise<void>((resolve, reject) => {
+        closePromise = (async () => {
+          for (const controller of controllers) {
+            controller.abort()
+          }
+
+          controllers.clear()
+
           for (const peer of peers) {
             peer.destroy()
           }
 
           peers.clear()
-          server.close(error => {
-            if (error) {
-              reject(error)
-            } else {
-              resolve()
-            }
+
+          await new Promise<void>((resolve, reject) => {
+            server.close(error => {
+              if (error) {
+                reject(error)
+              } else {
+                resolve()
+              }
+            })
           })
-        })
+
+          await Promise.allSettled([...tasks])
+        })()
       }
 
       return closePromise

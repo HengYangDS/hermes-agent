@@ -3,6 +3,8 @@
 // in an offscreen window and read its title. That window loads arbitrary
 // user-linked pages, so it must never emit sound or trigger real downloads.
 
+import { withLinkTitleTimeout } from './link-title-deadline'
+
 const BLOCKED_RESOURCE_TYPES = new Set(['cspReport', 'font', 'imageset', 'media', 'object', 'ping', 'stylesheet'])
 
 export function linkTitleWindowOptions(partitionSession) {
@@ -61,12 +63,15 @@ export function guardLinkTitleSession(partitionSession, admitUrl) {
   }
 }
 
-export async function configureLinkTitleSession(partitionSession, admitUrl, proxyUrl) {
-  await partitionSession.setProxy({
-    mode: 'fixed_servers',
-    proxyBypassRules: '<-loopback>',
-    proxyRules: proxyUrl
-  })
+export async function configureLinkTitleSession(partitionSession, admitUrl, proxyUrl, timeoutMs = 4_000) {
+  await withLinkTitleTimeout(
+    partitionSession.setProxy({
+      mode: 'fixed_servers',
+      proxyBypassRules: '<-loopback>',
+      proxyRules: proxyUrl
+    }),
+    timeoutMs
+  )
   guardLinkTitleSession(partitionSession, admitUrl)
 }
 
