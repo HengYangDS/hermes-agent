@@ -1,4 +1,4 @@
-import { admitLinkTitleUrl } from '@hermes/shared'
+import { admitLinkTitleUrl, isPublicLinkTitleAddress } from '@hermes/shared'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -37,6 +37,39 @@ afterEach(() => {
 })
 
 describe('external link helpers', () => {
+  it('accepts public bracketed or unbracketed IPv4 and IPv6 title addresses', () => {
+    expect(isPublicLinkTitleAddress('8.8.8.8')).toBe(true)
+    expect(isPublicLinkTitleAddress('[8.8.8.8]')).toBe(true)
+    expect(isPublicLinkTitleAddress('2606:4700:4700::1111')).toBe(true)
+    expect(isPublicLinkTitleAddress('[2606:4700:4700::1111]')).toBe(true)
+  })
+
+  it('preserves narrow public address exceptions', () => {
+    expect(isPublicLinkTitleAddress('192.0.0.9')).toBe(true)
+    expect(isPublicLinkTitleAddress('192.0.0.10')).toBe(true)
+    expect(isPublicLinkTitleAddress('2001:3::1')).toBe(true)
+  })
+
+  it.each([
+    ['IPv4 loopback', '127.0.0.1'],
+    ['IPv6 loopback', '::1'],
+    ['RFC1918 10/8', '10.0.0.1'],
+    ['RFC1918 172.16/12', '172.16.0.1'],
+    ['RFC1918 192.168/16', '192.168.0.1'],
+    ['IPv4 link-local', '169.254.0.1'],
+    ['IPv6 link-local', 'fe80::1'],
+    ['carrier-grade NAT', '100.64.0.1'],
+    ['IPv4 multicast', '224.0.0.1'],
+    ['IPv6 multicast', 'ff02::1'],
+    ['IPv4 documentation', '192.0.2.1'],
+    ['IPv6 documentation', '2001:db8::1'],
+    ['deprecated IPv6 site-local', 'fec0::1'],
+    ['IPv4-mapped private IPv6', '::ffff:7f00:1'],
+    ['NAT64-mapped private IPv6', '64:ff9b::7f00:1']
+  ])('rejects %s title addresses', (_label, address) => {
+    expect(isPublicLinkTitleAddress(address)).toBe(false)
+  })
+
   it('formats URL fallbacks as host + path', () => {
     expect(
       hostPathLabel(

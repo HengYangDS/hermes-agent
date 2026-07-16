@@ -169,6 +169,35 @@ function isLocalOnlyHostname(hostname: string): boolean {
   return LOCAL_ONLY_HOST_SUFFIXES.some(suffix => hostname === suffix || hostname.endsWith(`.${suffix}`))
 }
 
+function unbracketAddress(value: string): null | string {
+  const startsWithBracket = value.startsWith('[')
+  const endsWithBracket = value.endsWith(']')
+
+  if (startsWithBracket !== endsWithBracket) {
+    return null
+  }
+
+  return startsWithBracket ? value.slice(1, -1) : value
+}
+
+export function isPublicLinkTitleAddress(value: string): boolean {
+  const address = unbracketAddress(value)
+
+  if (address === null) {
+    return false
+  }
+
+  const ipv4 = canonicalIpv4Value(address)
+
+  if (ipv4 !== null) {
+    return !isNonPublicIpv4(ipv4)
+  }
+
+  const ipv6 = canonicalIpv6Words(`[${address}]`)
+
+  return ipv6 !== null && isPublicIpv6(ipv6)
+}
+
 export function admitLinkTitleUrl(value: string): null | string {
   let url: URL
 
@@ -184,14 +213,9 @@ export function admitLinkTitleUrl(value: string): null | string {
 
   const hostname = url.hostname.toLowerCase().replace(/\.$/, '')
   const ipv4 = canonicalIpv4Value(hostname)
-
-  if (ipv4 !== null && isNonPublicIpv4(ipv4)) {
-    return null
-  }
-
   const ipv6 = canonicalIpv6Words(hostname)
 
-  if (ipv6 && !isPublicIpv6(ipv6)) {
+  if ((ipv4 !== null || ipv6) && !isPublicLinkTitleAddress(hostname)) {
     return null
   }
 
