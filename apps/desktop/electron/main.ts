@@ -108,6 +108,7 @@ import {
   linkTitleCurlRequestArgs,
   parseLinkTitleCurlHeaders
 } from './link-title-curl'
+import { remainingLinkTitleMs, withLinkTitleTimeout } from './link-title-deadline'
 import { createLinkTitlePinnedResolver } from './link-title-dns'
 import { createLinkTitleFetcher } from './link-title-fetch'
 import {
@@ -4117,18 +4118,25 @@ function parseHtmlTitle(html) {
 }
 
 async function requestHtmlTitleWithCurl(url: string, timeoutMs: number): Promise<LinkTitleCurlHop> {
+  const deadline = Date.now() + timeoutMs
   let gateway
 
   try {
-    gateway = await linkTitleGatewayController.get()
+    gateway = await withLinkTitleTimeout(linkTitleGatewayController.get(), remainingLinkTitleMs(deadline))
   } catch {
     // The pinned transport is mandatory. Networks that require a system proxy
     // may return no preview rather than delegating DNS or connecting directly.
     return { body: '', location: null, statusCode: 0 }
   }
 
+  const requestTimeoutMs = remainingLinkTitleMs(deadline)
+
+  if (requestTimeoutMs <= 0) {
+    return { body: '', location: null, statusCode: 0 }
+  }
+
   return new Promise(resolve => {
-    const timeoutSeconds = Math.max(0.1, timeoutMs / 1000)
+    const timeoutSeconds = Math.max(0.1, requestTimeoutMs / 1000)
 
     const headerPath = path.join(
       os.tmpdir(),
@@ -4189,19 +4197,26 @@ const fetchHtmlTitleWithCurl = createLinkTitleCurlFetcher({
   timeoutMs: TITLE_TIMEOUT_MS
 })
 
-async function getLinkTitleSession() {
+async function getLinkTitleSession(timeoutMs: number) {
   if (linkTitleSession || !app.isReady()) {
     return linkTitleSession
   }
 
   if (linkTitleSessionPending) {
-    return linkTitleSessionPending
+    return withLinkTitleTimeout(linkTitleSessionPending, timeoutMs).catch(() => null)
   }
 
+  const deadline = Date.now() + timeoutMs
+
   const pending = (async () => {
-    const gateway = await linkTitleGatewayController.get()
+    const gateway = await withLinkTitleTimeout(linkTitleGatewayController.get(), remainingLinkTitleMs(deadline))
     const candidate = session.fromPartition('hermes:link-titles', { cache: false })
-    await configureLinkTitleSession(candidate, admitLinkTitleUrl, gateway.proxyUrl)
+    await configureLinkTitleSession(
+      candidate,
+      admitLinkTitleUrl,
+      gateway.proxyUrl,
+      remainingLinkTitleMs(deadline)
+    )
     linkTitleSession = candidate
 
     return candidate
@@ -4231,6 +4246,7 @@ function dequeueRenderTitle() {
 }
 
 async function runRenderTitleJob(rawUrl) {
+  const deadline = Date.now() + RENDER_TITLE_TIMEOUT_MS
   const url = admitLinkTitleUrl(rawUrl)
 
   if (!url) {
@@ -4241,9 +4257,15 @@ async function runRenderTitleJob(rawUrl) {
     return ''
   }
 
-  const partitionSession = await getLinkTitleSession()
+  const partitionSession = await getLinkTitleSession(remainingLinkTitleMs(deadline))
 
   if (!partitionSession) {
+    return ''
+  }
+
+  const remainingMs = remainingLinkTitleMs(deadline)
+
+  if (remainingMs <= 0) {
     return ''
   }
 
@@ -4298,7 +4320,7 @@ async function runRenderTitleJob(rawUrl) {
       graceTimer = setTimeout(finishWithTitle, RENDER_TITLE_GRACE_MS)
     }
 
-    hardTimer = setTimeout(finishWithTitle, RENDER_TITLE_TIMEOUT_MS)
+    hardTimer = setTimeout(finishWithTitle, remainingMs)
 
     window.webContents.setUserAgent(TITLE_USER_AGENT)
     window.webContents.on('page-title-updated', scheduleGrace)

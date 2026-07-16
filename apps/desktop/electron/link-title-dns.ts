@@ -86,14 +86,34 @@ function approveAnswers(
 export function createLinkTitlePinnedResolver(options: {
   isPublicAddress(value: string): boolean
   lookup?: LinkTitleLookup
+  maxEntries?: number
   now?: () => number
   ttlMs: number
 }): LinkTitlePinnedResolver {
   const cache = new Map<string, CachedAddresses>()
   const inflight = new Map<string, Promise<readonly LinkTitleAddress[]>>()
   const lookup = options.lookup ?? lookupAll
+  const maxEntries = Math.max(1, Math.floor(options.maxEntries ?? 512))
   const now = options.now ?? Date.now
   let generation = 0
+
+  const pruneCache = (currentTime: number) => {
+    for (const [hostname, cached] of cache) {
+      if (currentTime >= cached.expiresAt) {
+        cache.delete(hostname)
+      }
+    }
+
+    while (cache.size > maxEntries) {
+      const oldest = cache.keys().next().value
+
+      if (oldest === undefined) {
+        break
+      }
+
+      cache.delete(oldest)
+    }
+  }
 
   return {
     clear() {
@@ -113,13 +133,19 @@ export function createLinkTitlePinnedResolver(options: {
         return immutableAddresses([{ address: normalized, family: family === 4 ? 4 : 6 }])
       }
 
+      const currentTime = now()
+      pruneCache(currentTime)
       const cached = cache.get(normalized)
 
-      if (cached && now() < cached.expiresAt) {
+      if (cached) {
+        cache.delete(normalized)
+        cache.set(normalized, {
+          addresses: cached.addresses,
+          expiresAt: currentTime + options.ttlMs
+        })
+
         return cached.addresses
       }
-
-      cache.delete(normalized)
 
       const pending = inflight.get(normalized)
 
@@ -133,7 +159,20 @@ export function createLinkTitlePinnedResolver(options: {
         const approved = approveAnswers(await lookup(normalized), options.isPublicAddress)
 
         if (generation === startedGeneration) {
-          cache.set(normalized, { addresses: approved, expiresAt: now() + options.ttlMs })
+          const resolvedAt = now()
+          pruneCache(resolvedAt)
+
+          while (cache.size >= maxEntries) {
+            const oldest = cache.keys().next().value
+
+            if (oldest === undefined) {
+              break
+            }
+
+            cache.delete(oldest)
+          }
+
+          cache.set(normalized, { addresses: approved, expiresAt: resolvedAt + options.ttlMs })
         }
 
         return approved

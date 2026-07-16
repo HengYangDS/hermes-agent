@@ -132,6 +132,24 @@ test('configureLinkTitleSession fails before installing guards when proxy setup 
   assert.equal(guarded, false)
 })
 
+test('configureLinkTitleSession times out instead of holding a renderer queue slot forever', async () => {
+  const partitionSession = {
+    on() {},
+    setProxy: () => new Promise(() => undefined),
+    webRequest: { onBeforeRequest() {} }
+  }
+
+  const result = await Promise.race([
+    configureLinkTitleSession(partitionSession, value => value, 'socks5://127.0.0.1:48123', 20).then(
+      () => 'resolved',
+      error => String(error?.message || error)
+    ),
+    new Promise<string>(resolve => setTimeout(() => resolve('still pending'), 200))
+  ])
+
+  assert.match(result, /timed out/i)
+})
+
 test('guardLinkTitleSession blocks rejected redirects and subrequests while allowing public HTTP(S)', () => {
   let beforeRequest
 
