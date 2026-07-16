@@ -61,6 +61,15 @@ export function guardLinkTitleSession(partitionSession, admitUrl) {
   }
 }
 
+export async function configureLinkTitleSession(partitionSession, admitUrl, proxyUrl) {
+  await partitionSession.setProxy({
+    mode: 'fixed_servers',
+    proxyBypassRules: '<-loopback>',
+    proxyRules: proxyUrl
+  })
+  guardLinkTitleSession(partitionSession, admitUrl)
+}
+
 // Read the page title from a title-fetch window. Callers schedule this from
 // timers that can fire after finish() destroys the window, so every access must
 // guard isDestroyed and swallow Electron's "Object has been destroyed" throws.
