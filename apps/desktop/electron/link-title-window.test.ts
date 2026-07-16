@@ -11,7 +11,7 @@ import {
 } from './link-title-window'
 
 function makeFakeBrowserWindow() {
-  const calls = { audioMuted: [], destroyed: 0, webRtcPolicies: [] }
+  const calls = { audioMuted: [], destroyed: 0, webRtcPolicies: [], windowOpenHandlers: [] }
 
   const FakeBrowserWindow = function (options) {
     this.options = options
@@ -23,6 +23,9 @@ function makeFakeBrowserWindow() {
     this.webContents = {
       setAudioMuted(value) {
         calls.audioMuted.push(value)
+      },
+      setWindowOpenHandler(handler) {
+        calls.windowOpenHandlers.push(handler)
       },
       setWebRTCIPHandlingPolicy(value) {
         calls.webRtcPolicies.push(value)
@@ -55,6 +58,8 @@ test('createLinkTitleWindow mutes audio so historical links never autoplay sound
   assert.ok(window instanceof FakeBrowserWindow)
   assert.deepEqual(calls.audioMuted, [true])
   assert.deepEqual(calls.webRtcPolicies, ['disable_non_proxied_udp'])
+  assert.equal(calls.windowOpenHandlers.length, 1)
+  assert.deepEqual(calls.windowOpenHandlers[0](), { action: 'deny' })
 })
 
 test('createLinkTitleWindow still returns the window if muting throws', () => {
@@ -64,6 +69,7 @@ test('createLinkTitleWindow still returns the window if muting throws', () => {
       setAudioMuted() {
         throw new Error('webContents unavailable')
       },
+      setWindowOpenHandler() {},
       setWebRTCIPHandlingPolicy() {}
     }
   }
@@ -85,6 +91,7 @@ test('createLinkTitleWindow fails closed when non-proxied WebRTC cannot be disab
 
     this.webContents = {
       setAudioMuted() {},
+      setWindowOpenHandler() {},
       setWebRTCIPHandlingPolicy() {
         throw new Error('WebRTC policy unavailable')
       }
@@ -94,6 +101,32 @@ test('createLinkTitleWindow fails closed when non-proxied WebRTC cannot be disab
   assert.throws(
     () => createLinkTitleWindow(ThrowingBrowserWindow, { id: 'link-titles' }),
     /WebRTC policy unavailable/
+  )
+  assert.equal(destroyed, true)
+})
+
+test('createLinkTitleWindow fails closed when popup creation cannot be denied', () => {
+  let destroyed = false
+
+  const ThrowingBrowserWindow = function (options) {
+    this.options = options
+
+    this.destroy = () => {
+      destroyed = true
+    }
+
+    this.webContents = {
+      setAudioMuted() {},
+      setWindowOpenHandler() {
+        throw new Error('window-open policy unavailable')
+      },
+      setWebRTCIPHandlingPolicy() {}
+    }
+  }
+
+  assert.throws(
+    () => createLinkTitleWindow(ThrowingBrowserWindow, { id: 'link-titles' }),
+    /window-open policy unavailable/
   )
   assert.equal(destroyed, true)
 })

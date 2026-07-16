@@ -31,6 +31,7 @@ export function createLinkTitleWindow(BrowserWindow, partitionSession) {
   const window = new BrowserWindow(linkTitleWindowOptions(partitionSession))
 
   try {
+    window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
     window.webContents.setWebRTCIPHandlingPolicy('disable_non_proxied_udp')
   } catch (error) {
     try {
