@@ -111,6 +111,7 @@ import {
 import { remainingLinkTitleMs, withLinkTitleTimeout } from './link-title-deadline'
 import { createLinkTitlePinnedResolver } from './link-title-dns'
 import { createLinkTitleFetcher } from './link-title-fetch'
+import { createLinkTitleRenderQueue } from './link-title-render-queue'
 import {
   createLinkTitleSocksGatewayController,
   startLinkTitleSocksGateway
@@ -4060,9 +4061,11 @@ const RENDER_TITLE_GRACE_MS = 700
 
 let linkTitleSession = null
 let linkTitleSessionPending = null
+let linkTitleQuitting = false
+let linkTitleQuitCleanupStarted = false
+let linkTitleGatewayClosed = false
+let linkTitleGatewayClosePromise: Promise<void> | null = null
 let oauthSession = null
-let renderTitleInFlight = 0
-const renderTitleQueue = []
 
 const linkTitleResolver = createLinkTitlePinnedResolver({
   isPublicAddress: isPublicLinkTitleAddress,
@@ -4118,6 +4121,10 @@ function parseHtmlTitle(html) {
 }
 
 async function requestHtmlTitleWithCurl(url: string, timeoutMs: number): Promise<LinkTitleCurlHop> {
+  if (linkTitleQuitting) {
+    return { body: '', location: null, statusCode: 0 }
+  }
+
   const deadline = Date.now() + timeoutMs
   let gateway
 
@@ -4198,7 +4205,11 @@ const fetchHtmlTitleWithCurl = createLinkTitleCurlFetcher({
 })
 
 async function getLinkTitleSession(timeoutMs: number) {
-  if (linkTitleSession || !app.isReady()) {
+  if (linkTitleQuitting || !app.isReady()) {
+    return null
+  }
+
+  if (linkTitleSession) {
     return linkTitleSession
   }
 
@@ -4233,23 +4244,10 @@ async function getLinkTitleSession(timeoutMs: number) {
   return pending
 }
 
-function dequeueRenderTitle() {
-  while (renderTitleInFlight < RENDER_TITLE_MAX_CONCURRENT && renderTitleQueue.length) {
-    const item = renderTitleQueue.shift()
-    renderTitleInFlight += 1
-    runRenderTitleJob(item.url).then(title => {
-      renderTitleInFlight -= 1
-      item.resolve(title)
-      dequeueRenderTitle()
-    })
-  }
-}
-
-async function runRenderTitleJob(rawUrl) {
-  const deadline = Date.now() + RENDER_TITLE_TIMEOUT_MS
+async function runRenderTitleJob(rawUrl: string, deadline: number): Promise<string> {
   const url = admitLinkTitleUrl(rawUrl)
 
-  if (!url) {
+  if (!url || linkTitleQuitting) {
     return ''
   }
 
@@ -4259,7 +4257,7 @@ async function runRenderTitleJob(rawUrl) {
 
   const partitionSession = await getLinkTitleSession(remainingLinkTitleMs(deadline))
 
-  if (!partitionSession) {
+  if (!partitionSession || linkTitleQuitting) {
     return ''
   }
 
@@ -4269,7 +4267,7 @@ async function runRenderTitleJob(rawUrl) {
     return ''
   }
 
-  return new Promise(resolve => {
+  return new Promise<string>(resolve => {
 
     let settled = false
     let window = null
@@ -4340,17 +4338,20 @@ async function runRenderTitleJob(rawUrl) {
   })
 }
 
+const linkTitleRenderQueue = createLinkTitleRenderQueue({
+  concurrency: RENDER_TITLE_MAX_CONCURRENT,
+  run: runRenderTitleJob,
+  timeoutMs: RENDER_TITLE_TIMEOUT_MS
+})
+
 function fetchHtmlTitleWithRenderer(rawUrl: string): Promise<string> {
   const url = admitLinkTitleUrl(rawUrl)
 
-  if (!url) {
+  if (!url || linkTitleQuitting) {
     return Promise.resolve('')
   }
 
-  return new Promise(resolve => {
-    renderTitleQueue.push({ resolve, url })
-    dequeueRenderTitle()
-  })
+  return linkTitleRenderQueue.enqueue(url)
 }
 
 // Strips known error/captcha titles (e.g. "GetYourGuide – Error", "Just a
@@ -9559,9 +9560,19 @@ app.on('before-quit', () => {
     }
   }
 
+  if (linkTitleQuitCleanupStarted) {
+    return
+  }
+
+  linkTitleQuitCleanupStarted = true
+  linkTitleQuitting = true
+  linkTitleRenderQueue.close()
   linkTitleSession = null
   linkTitleSessionPending = null
-  void linkTitleGatewayController.close()
+  linkTitleGatewayClosePromise = linkTitleGatewayController.close().catch(() => undefined)
+  void linkTitleGatewayClosePromise.finally(() => {
+    linkTitleGatewayClosed = true
+  })
 
   // The always-on-top overlay isn't a "real" app window; close it so a stray
   // pet can't keep the process alive or float over a quit app.
@@ -9592,6 +9603,15 @@ app.on('before-quit', () => {
 
   stopBackendChild(backendConnectionState.getProcess())
   stopAllPoolBackends()
+})
+
+app.on('will-quit', event => {
+  if (!linkTitleGatewayClosePromise || linkTitleGatewayClosed) {
+    return
+  }
+
+  event.preventDefault()
+  void linkTitleGatewayClosePromise.finally(() => app.quit())
 })
 
 app.on('window-all-closed', () => {
