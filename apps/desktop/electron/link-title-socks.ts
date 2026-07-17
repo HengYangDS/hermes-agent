@@ -78,12 +78,24 @@ function ipv6FromBytes(value: Buffer): string {
   return words.join(':')
 }
 
-function abortError(): Error {
-  return new Error('Link title SOCKS operation was aborted')
+class LinkTitleSocksAbortError extends Error {
+  constructor() {
+    super('Link title SOCKS operation was aborted')
+  }
 }
 
-function timeoutError(): Error {
-  return new Error('Link title SOCKS operation timed out')
+class LinkTitleSocksTimeoutError extends Error {
+  constructor() {
+    super('Link title SOCKS operation timed out')
+  }
+}
+
+function abortError(): LinkTitleSocksAbortError {
+  return new LinkTitleSocksAbortError()
+}
+
+function timeoutError(): LinkTitleSocksTimeoutError {
+  return new LinkTitleSocksTimeoutError()
 }
 
 function awaitWithin<T>(operation: PromiseLike<T>, signal: AbortSignal, deadline: number): Promise<T> {
@@ -216,6 +228,10 @@ async function connectToApprovedAddress(
       return upstream
     } catch (error) {
       lastError = error
+
+      if (error instanceof LinkTitleSocksAbortError || error instanceof LinkTitleSocksTimeoutError) {
+        throw error
+      }
     }
   }
 

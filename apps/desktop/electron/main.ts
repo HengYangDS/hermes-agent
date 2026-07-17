@@ -119,7 +119,6 @@ import {
 import {
   configureLinkTitleSession,
   createLinkTitleWindow,
-  guardLinkTitleSession,
   readLinkTitleWindowTitle
 } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
