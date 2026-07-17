@@ -101,7 +101,25 @@ import {
   resolveTimeoutMs,
   TEXT_PREVIEW_SOURCE_MAX_BYTES
 } from './hardening'
-import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
+import {
+  createLinkTitleCurlFetcher,
+  type LinkTitleCurlHop,
+  linkTitleCurlRequestArgs,
+  parseLinkTitleCurlHeaders
+} from './link-title-curl'
+import { remainingLinkTitleMs, withLinkTitleTimeout } from './link-title-deadline'
+import { createLinkTitlePinnedResolver } from './link-title-dns'
+import { createLinkTitleFetcher } from './link-title-fetch'
+import { createLinkTitleRenderQueue } from './link-title-render-queue'
+import {
+  createLinkTitleSocksGatewayController,
+  startLinkTitleSocksGateway
+} from './link-title-socks'
+import {
+  configureLinkTitleSession,
+  createLinkTitleWindow,
+  readLinkTitleWindowTitle
+} from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
 import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
 import { decideProfileDeleteAction, profileNameFromDeleteRequest, resolveRouteProfile } from './profile-delete-routing'
@@ -3858,12 +3876,21 @@ function filenameFromUrl(rawUrl, fallback = 'image') {
 }
 
 // Link title resolution — curl (tier 1) → hidden BrowserWindow (tier 2).
+// Use bundle-time require here so the Electron composite project does not pull
+// the shared workspace's source tree under its own rootDir.
+const { admitLinkTitleUrl, isPublicLinkTitleAddress } = require('@hermes/shared') as {
+  admitLinkTitleUrl: (value: string) => null | string
+  isPublicLinkTitleAddress: (value: string) => boolean
+}
+
 const titleCache = new Map()
 const titleInflight = new Map()
 const TITLE_CACHE_LIMIT = 500
 const TITLE_BYTE_BUDGET = 96 * 1024
 const TITLE_TIMEOUT_MS = 5000
 const TITLE_MAX_REDIRECTS = 3
+const TITLE_DNS_PIN_TTL_MS = 30_000
+const TITLE_CONNECT_TIMEOUT_MS = 4_000
 
 // Browser-shaped UA — many bot-walled sites (GetYourGuide, Cloudflare-protected
 // pages) refuse anything that doesn't look like a real Chrome.
@@ -3881,22 +3908,27 @@ const RENDER_TITLE_MAX_CONCURRENT = 2
 const RENDER_TITLE_TIMEOUT_MS = 8000
 const RENDER_TITLE_GRACE_MS = 700
 
-// Resource types we cancel before the network even fires — keeps the hidden
-// renderer fast and cuts third-party tracking noise.
-const RENDER_TITLE_BLOCKED_RESOURCES = new Set([
-  'cspReport',
-  'font',
-  'imageset',
-  'media',
-  'object',
-  'ping',
-  'stylesheet'
-])
-
 let linkTitleSession = null
+let linkTitleSessionPending = null
+let linkTitleQuitting = false
+let linkTitleQuitCleanupStarted = false
+let linkTitleGatewayClosed = false
+let linkTitleGatewayClosePromise: Promise<void> | null = null
 let oauthSession = null
-let renderTitleInFlight = 0
-const renderTitleQueue = []
+
+const linkTitleResolver = createLinkTitlePinnedResolver({
+  isPublicAddress: isPublicLinkTitleAddress,
+  ttlMs: TITLE_DNS_PIN_TTL_MS
+})
+
+const linkTitleGatewayController = createLinkTitleSocksGatewayController({
+  clearPins: linkTitleResolver.clear,
+  start: () =>
+    startLinkTitleSocksGateway({
+      connectTimeoutMs: TITLE_CONNECT_TIMEOUT_MS,
+      resolve: linkTitleResolver.resolve
+    })
+})
 
 function canonicalTitleCacheKey(rawUrl) {
   const value = String(rawUrl || '').trim()
@@ -3937,39 +3969,64 @@ function parseHtmlTitle(html) {
   return raw ? decodeHtmlEntities(raw).replace(/\s+/g, ' ').trim() : ''
 }
 
-function fetchHtmlTitleWithCurl(rawUrl: string): Promise<string> {
+async function requestHtmlTitleWithCurl(url: string, timeoutMs: number): Promise<LinkTitleCurlHop> {
+  if (linkTitleQuitting) {
+    return { body: '', location: null, statusCode: 0 }
+  }
+
+  const deadline = Date.now() + timeoutMs
+  let gateway
+
+  try {
+    gateway = await withLinkTitleTimeout(linkTitleGatewayController.get(), remainingLinkTitleMs(deadline))
+  } catch {
+    // The pinned transport is mandatory. Networks that require a system proxy
+    // may return no preview rather than delegating DNS or connecting directly.
+    return { body: '', location: null, statusCode: 0 }
+  }
+
+  const requestTimeoutMs = remainingLinkTitleMs(deadline)
+
+  if (requestTimeoutMs <= 0) {
+    return { body: '', location: null, statusCode: 0 }
+  }
+
   return new Promise(resolve => {
-    const url = String(rawUrl || '').trim()
+    const timeoutSeconds = Math.max(0.1, requestTimeoutMs / 1000)
 
-    if (!url) {
-      return resolve('')
-    }
+    const headerPath = path.join(
+      os.tmpdir(),
+      `hermes-link-title-${process.pid}-${crypto.randomBytes(6).toString('hex')}.headers`
+    )
 
-    const args = [
-      '--silent',
-      '--show-error',
-      '--location',
-      '--max-redirs',
-      String(TITLE_MAX_REDIRECTS),
-      '--max-time',
-      String(Math.max(2, Math.ceil(TITLE_TIMEOUT_MS / 1000))),
-      '--connect-timeout',
-      '4',
-      '--user-agent',
-      TITLE_USER_AGENT,
-      '--header',
-      'Accept: text/html,application/xhtml+xml;q=0.9,*/*;q=0.5',
-      '--header',
-      'Accept-Language: en-US,en;q=0.7',
-      '--header',
-      'Accept-Encoding: identity',
-      '--raw',
-      url
-    ]
+    const args = linkTitleCurlRequestArgs(url, {
+      connectTimeoutSeconds: Math.min(4, timeoutSeconds),
+      headerPath,
+      maxBytes: TITLE_BYTE_BUDGET,
+      proxyUrl: gateway.proxyUrl,
+      timeoutSeconds,
+      userAgent: TITLE_USER_AGENT
+    })
 
     const child = spawn('curl', args, hiddenWindowsChildOptions({ stdio: ['ignore', 'pipe', 'ignore'] }))
     const chunks = []
     let bytes = 0
+    let settled = false
+
+    const finish = async () => {
+      if (settled) {
+        return
+      }
+
+      settled = true
+      const headers = await fs.promises.readFile(headerPath, 'utf8').catch(() => '')
+      await fs.promises.unlink(headerPath).catch(() => undefined)
+
+      resolve({
+        body: chunks.length ? Buffer.concat(chunks).toString('utf8') : '',
+        ...parseLinkTitleCurlHeaders(headers)
+      })
+    }
 
     child.stdout.on('data', chunk => {
       if (bytes >= TITLE_BYTE_BUDGET) {
@@ -3983,54 +4040,83 @@ function fetchHtmlTitleWithCurl(rawUrl: string): Promise<string> {
       bytes += next.length
     })
 
-    child.on('error', () => resolve(''))
-    child.on('close', () => {
-      if (!chunks.length) {
-        return resolve('')
-      }
-
-      resolve(parseHtmlTitle(Buffer.concat(chunks).toString('utf8')))
-    })
+    child.on('error', () => void finish())
+    child.on('close', () => void finish())
   })
 }
 
-function getLinkTitleSession() {
-  if (linkTitleSession || !app.isReady()) {
+const fetchHtmlTitleWithCurl = createLinkTitleCurlFetcher({
+  admitUrl: admitLinkTitleUrl,
+  maxRedirects: TITLE_MAX_REDIRECTS,
+  readTitle: parseHtmlTitle,
+  request: requestHtmlTitleWithCurl,
+  timeoutMs: TITLE_TIMEOUT_MS
+})
+
+async function getLinkTitleSession(timeoutMs: number) {
+  if (linkTitleQuitting || !app.isReady()) {
+    return null
+  }
+
+  if (linkTitleSession) {
     return linkTitleSession
   }
 
-  linkTitleSession = session.fromPartition('hermes:link-titles', { cache: false })
-  linkTitleSession.webRequest.onBeforeRequest((details, callback) => {
-    callback({ cancel: RENDER_TITLE_BLOCKED_RESOURCES.has(details.resourceType) })
-  })
-  guardLinkTitleSession(linkTitleSession)
-
-  return linkTitleSession
-}
-
-function dequeueRenderTitle() {
-  while (renderTitleInFlight < RENDER_TITLE_MAX_CONCURRENT && renderTitleQueue.length) {
-    const item = renderTitleQueue.shift()
-    renderTitleInFlight += 1
-    runRenderTitleJob(item.url).then(title => {
-      renderTitleInFlight -= 1
-      item.resolve(title)
-      dequeueRenderTitle()
-    })
+  if (linkTitleSessionPending) {
+    return withLinkTitleTimeout(linkTitleSessionPending, timeoutMs).catch(() => null)
   }
+
+  const deadline = Date.now() + timeoutMs
+
+  const pending = (async () => {
+    const gateway = await withLinkTitleTimeout(linkTitleGatewayController.get(), remainingLinkTitleMs(deadline))
+    const candidate = session.fromPartition('hermes:link-titles', { cache: false })
+    await configureLinkTitleSession(
+      candidate,
+      admitLinkTitleUrl,
+      gateway.proxyUrl,
+      remainingLinkTitleMs(deadline)
+    )
+    linkTitleSession = candidate
+
+    return candidate
+  })()
+    .catch(() => null)
+    .finally(() => {
+      if (linkTitleSessionPending === pending) {
+        linkTitleSessionPending = null
+      }
+    })
+
+  linkTitleSessionPending = pending
+
+  return pending
 }
 
-function runRenderTitleJob(rawUrl) {
-  return new Promise(resolve => {
-    if (!app.isReady()) {
-      return resolve('')
-    }
+async function runRenderTitleJob(rawUrl: string, deadline: number): Promise<string> {
+  const url = admitLinkTitleUrl(rawUrl)
 
-    const partitionSession = getLinkTitleSession()
+  if (!url || linkTitleQuitting) {
+    return ''
+  }
 
-    if (!partitionSession) {
-      return resolve('')
-    }
+  if (!app.isReady()) {
+    return ''
+  }
+
+  const partitionSession = await getLinkTitleSession(remainingLinkTitleMs(deadline))
+
+  if (!partitionSession || linkTitleQuitting) {
+    return ''
+  }
+
+  const remainingMs = remainingLinkTitleMs(deadline)
+
+  if (remainingMs <= 0) {
+    return ''
+  }
+
+  return new Promise<string>(resolve => {
 
     let settled = false
     let window = null
@@ -4081,7 +4167,7 @@ function runRenderTitleJob(rawUrl) {
       graceTimer = setTimeout(finishWithTitle, RENDER_TITLE_GRACE_MS)
     }
 
-    hardTimer = setTimeout(finishWithTitle, RENDER_TITLE_TIMEOUT_MS)
+    hardTimer = setTimeout(finishWithTitle, remainingMs)
 
     window.webContents.setUserAgent(TITLE_USER_AGENT)
     window.webContents.on('page-title-updated', scheduleGrace)
@@ -4093,7 +4179,7 @@ function runRenderTitleJob(rawUrl) {
     })
 
     window
-      .loadURL(rawUrl, {
+      .loadURL(url, {
         httpReferrer: 'https://www.google.com/',
         userAgent: TITLE_USER_AGENT
       })
@@ -4101,11 +4187,20 @@ function runRenderTitleJob(rawUrl) {
   })
 }
 
+const linkTitleRenderQueue = createLinkTitleRenderQueue({
+  concurrency: RENDER_TITLE_MAX_CONCURRENT,
+  run: runRenderTitleJob,
+  timeoutMs: RENDER_TITLE_TIMEOUT_MS
+})
+
 function fetchHtmlTitleWithRenderer(rawUrl: string): Promise<string> {
-  return new Promise(resolve => {
-    renderTitleQueue.push({ resolve, url: rawUrl })
-    dequeueRenderTitle()
-  })
+  const url = admitLinkTitleUrl(rawUrl)
+
+  if (!url || linkTitleQuitting) {
+    return Promise.resolve('')
+  }
+
+  return linkTitleRenderQueue.enqueue(url)
 }
 
 // Strips known error/captcha titles (e.g. "GetYourGuide – Error", "Just a
@@ -4114,39 +4209,16 @@ function usableTitle(value: string): string {
   return value && !TITLE_ERROR_RE.test(value) ? value : ''
 }
 
-function fetchLinkTitle(rawUrl) {
-  const url = String(rawUrl || '').trim()
-  const key = canonicalTitleCacheKey(url)
-
-  if (!key) {
-    return Promise.resolve('')
-  }
-
-  if (titleCache.has(key)) {
-    return Promise.resolve(titleCache.get(key))
-  }
-
-  if (titleInflight.has(key)) {
-    return titleInflight.get(key)
-  }
-
-  const pending = fetchHtmlTitleWithCurl(url)
-    .catch(() => '')
-    .then(value => usableTitle((value || '').slice(0, 240)))
-    .then(
-      async value => value || usableTitle(((await fetchHtmlTitleWithRenderer(url).catch(() => '')) || '').slice(0, 240))
-    )
-    .then(clean => {
-      cacheTitle(key, clean)
-      titleInflight.delete(key)
-
-      return clean
-    })
-
-  titleInflight.set(key, pending)
-
-  return pending
-}
+const fetchLinkTitle = createLinkTitleFetcher({
+  admitUrl: admitLinkTitleUrl,
+  cache: titleCache,
+  cacheKey: canonicalTitleCacheKey,
+  fetchWithCurl: fetchHtmlTitleWithCurl,
+  fetchWithRenderer: fetchHtmlTitleWithRenderer,
+  inflight: titleInflight,
+  normalizeTitle: usableTitle,
+  storeCachedTitle: cacheTitle
+})
 
 async function resourceBufferFromUrl(rawUrl) {
   if (!rawUrl) {
@@ -9207,6 +9279,20 @@ function configureSpellChecker() {
 }
 
 app.on('before-quit', () => {
+  if (linkTitleQuitCleanupStarted) {
+    return
+  }
+
+  linkTitleQuitCleanupStarted = true
+  linkTitleQuitting = true
+  linkTitleRenderQueue.close()
+  linkTitleSession = null
+  linkTitleSessionPending = null
+  linkTitleGatewayClosePromise = linkTitleGatewayController.close().catch(() => undefined)
+  void linkTitleGatewayClosePromise.finally(() => {
+    linkTitleGatewayClosed = true
+  })
+
   // The always-on-top overlay isn't a "real" app window; close it so a stray
   // pet can't keep the process alive or float over a quit app.
   closePetOverlay()
@@ -9236,6 +9322,15 @@ app.on('before-quit', () => {
 
   stopBackendChild(backendConnectionState.getProcess())
   stopAllPoolBackends()
+})
+
+app.on('will-quit', event => {
+  if (!linkTitleGatewayClosePromise || linkTitleGatewayClosed) {
+    return
+  }
+
+  event.preventDefault()
+  void linkTitleGatewayClosePromise.finally(() => app.quit())
 })
 
 app.on('window-all-closed', () => {

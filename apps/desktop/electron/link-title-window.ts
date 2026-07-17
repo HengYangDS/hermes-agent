@@ -3,6 +3,10 @@
 // in an offscreen window and read its title. That window loads arbitrary
 // user-linked pages, so it must never emit sound or trigger real downloads.
 
+import { withLinkTitleTimeout } from './link-title-deadline'
+
+const BLOCKED_RESOURCE_TYPES = new Set(['cspReport', 'font', 'imageset', 'media', 'object', 'ping', 'stylesheet'])
+
 export function linkTitleWindowOptions(partitionSession) {
   return {
     show: false,
@@ -27,6 +31,19 @@ export function createLinkTitleWindow(BrowserWindow, partitionSession) {
   const window = new BrowserWindow(linkTitleWindowOptions(partitionSession))
 
   try {
+    window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+    window.webContents.setWebRTCIPHandlingPolicy('disable_non_proxied_udp')
+  } catch (error) {
+    try {
+      window.destroy()
+    } catch {
+      // The security boundary failed before navigation; teardown is best-effort.
+    }
+
+    throw error
+  }
+
+  try {
     window.webContents.setAudioMuted(true)
   } catch {
     // webContents may be unavailable in degraded/headless environments; muting
@@ -36,15 +53,39 @@ export function createLinkTitleWindow(BrowserWindow, partitionSession) {
   return window
 }
 
-// Cancel any download the title-fetch window triggers. Without this, a link
-// artifact URL served with Content-Disposition: attachment auto-downloads every
-// time the Artifacts page renders and fetchLinkTitle loads it.
-export function guardLinkTitleSession(partitionSession) {
+// Reject disallowed navigation/subresource requests and cancel any download
+// the title-fetch window triggers. The request listener is intentionally owned
+// here because Electron sessions keep one onBeforeRequest handler per event.
+export function guardLinkTitleSession(partitionSession, admitUrl) {
+  partitionSession.webRequest.onBeforeRequest((details, callback) => {
+    let admittedUrl = null
+
+    try {
+      admittedUrl = admitUrl(details.url)
+    } catch {
+      // Admission errors fail closed for this isolated title-fetch session.
+    }
+
+    callback({ cancel: BLOCKED_RESOURCE_TYPES.has(details.resourceType) || !admittedUrl })
+  })
+
   try {
     partitionSession.on('will-download', (_event, item) => item.cancel())
   } catch {
     // best-effort; worst case is a spurious download
   }
+}
+
+export async function configureLinkTitleSession(partitionSession, admitUrl, proxyUrl, timeoutMs = 4_000) {
+  await withLinkTitleTimeout(
+    partitionSession.setProxy({
+      mode: 'fixed_servers',
+      proxyBypassRules: '<-loopback>',
+      proxyRules: proxyUrl
+    }),
+    timeoutMs
+  )
+  guardLinkTitleSession(partitionSession, admitUrl)
 }
 
 // Read the page title from a title-fetch window. Callers schedule this from
