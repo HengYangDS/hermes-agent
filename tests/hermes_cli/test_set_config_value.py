@@ -96,6 +96,15 @@ class TestCatchAllPatterns:
 class TestConfigYamlRouting:
     """Regular config keys should go to config.yaml, NOT .env."""
 
+    def test_yaml_list_literal_becomes_a_yaml_list(self, _isolated_hermes_home):
+        """Shell-friendly YAML list input must not persist as a scalar string."""
+        set_config_value("command_allowlist", "['git','ollama','brew']")
+
+        import yaml
+
+        reloaded = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert reloaded["command_allowlist"] == ["git", "ollama", "brew"]
+
     def test_simple_key(self, _isolated_hermes_home):
         set_config_value("model", "gpt-4o")
         config = _read_config(_isolated_hermes_home)

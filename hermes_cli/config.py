@@ -8463,7 +8463,15 @@ def set_config_value(key: str, value: str):
     # such as approvals.mode="off" must not become YAML booleans.  Unknown keys
     # retain the historical best-effort coercion behavior.
     coerced_value: Any = value
-    if not isinstance(_default_value_for_key(key), str):
+    default_value = _default_value_for_key(key)
+    if isinstance(default_value, (dict, list)):
+        try:
+            parsed_value = yaml.safe_load(value)
+        except yaml.YAMLError:
+            parsed_value = None
+        if isinstance(parsed_value, type(default_value)):
+            coerced_value = parsed_value
+    elif not isinstance(default_value, str):
         if value.lower() in {'true', 'yes', 'on'}:
             coerced_value = True
         elif value.lower() in {'false', 'no', 'off'}:
