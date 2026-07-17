@@ -3200,7 +3200,7 @@ function isActiveRuntimeUsable() {
   )
 }
 
-function isBootstrapComplete() {
+function hasCurrentBootstrapMarker() {
   const marker = readBootstrapMarker()
 
   if (!marker || typeof marker !== 'object') {
@@ -3212,6 +3212,14 @@ function isBootstrapComplete() {
   }
 
   if (typeof marker.pinnedCommit !== 'string' || marker.pinnedCommit.length < 7) {
+    return false
+  }
+
+  return true
+}
+
+function isBootstrapComplete() {
+  if (!hasCurrentBootstrapMarker()) {
     return false
   }
 
@@ -3490,6 +3498,28 @@ function resolveHermesBackend(backendArgs) {
   //    (applyUpdates -> git pull) or `hermes update` from the CLI.
   if (isBootstrapComplete()) {
     return createActiveBackend(backendArgs)
+  }
+
+  // A valid bootstrap receipt with a failed runtime probe means the checkout
+  // exists but its venv is incomplete or internally inconsistent. Do not
+  // silently fall back to an unrelated global `hermes` on PATH: refresh the
+  // authoritative active install that the receipt attests instead.
+  if (hasCurrentBootstrapMarker()) {
+    rememberLog('[bootstrap] active Hermes runtime failed preflight; refreshing the active install.')
+
+    return {
+      kind: 'bootstrap-needed',
+      label: 'Hermes Agent runtime needs repair; bootstrap required',
+      command: null,
+      args: backendArgs,
+      bootstrap: true,
+      env: {},
+      shell: false,
+      activeRoot: ACTIVE_HERMES_ROOT,
+      installStamp: INSTALL_STAMP,
+      isPackaged: IS_PACKAGED,
+      platform: process.platform
+    }
   }
 
   // 4. Existing `hermes` on PATH -- installed via install.ps1 / install.sh from
