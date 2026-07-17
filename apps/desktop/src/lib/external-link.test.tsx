@@ -113,6 +113,14 @@ describe('external link helpers', () => {
     expect(isTitleFetchable('mailto:hello@example.com')).toBe(false)
   })
 
+  it.each([
+    'https://github.com/NousResearch/hermes-agent.git\\ncd',
+    'https://github.com/NousResearch/hermes-agent.git%5Cncd'
+  ])('rejects title URLs that carry an escaped shell continuation: %s', value => {
+    expect(admitLinkTitleUrl(value)).toBeNull()
+    expect(isTitleFetchable(value)).toBe(false)
+  })
+
   it('does not ask Electron to fetch titles for blocked local targets', async () => {
     const bridge = vi.fn().mockResolvedValue('unexpected')
     installDesktopBridge({ fetchLinkTitle: bridge as unknown as Window['hermesDesktop']['fetchLinkTitle'] })

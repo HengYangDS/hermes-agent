@@ -198,7 +198,22 @@ export function isPublicLinkTitleAddress(value: string): boolean {
   return ipv6 !== null && isPublicIpv6(ipv6)
 }
 
+const URL_CONTROL_CHARACTER_RE = /[\u0000-\u001f\u007f]/
+const ENCODED_URL_CONTROL_CHARACTER_RE = /%(?:0[0-9a-f]|1[0-9a-f]|7f)/i
+// A pasted shell snippet such as `https://example.test/repo\\ncd repo` must
+// not become a title-preview navigation. WHATWG URL canonicalization otherwise
+// turns the backslash into a path separator before this function can inspect it.
+const ESCAPED_SHELL_CONTROL_RE = /(?:\\|%5c)[nrt]/i
+
 export function admitLinkTitleUrl(value: string): null | string {
+  if (
+    URL_CONTROL_CHARACTER_RE.test(value) ||
+    ENCODED_URL_CONTROL_CHARACTER_RE.test(value) ||
+    ESCAPED_SHELL_CONTROL_RE.test(value)
+  ) {
+    return null
+  }
+
   let url: URL
 
   try {
