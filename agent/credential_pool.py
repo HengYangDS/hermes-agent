@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from hermes_constants import OPENROUTER_BASE_URL
 from hermes_cli.config import load_env
+from agent.secret_scope import current_secret_scope as _current_secret_scope
 from agent.secret_scope import get_secret as _get_secret
 from agent.credential_persistence import (
     is_borrowed_credential_source,
@@ -2319,9 +2320,15 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
         # references straight into .env rather than the secrets.onepassword
         # config block.  For every non-op:// value the original
         # .env-takes-precedence behaviour is preserved unchanged.
-        if raw.startswith("op://") and env_val:
-            return env_val
-        return raw or _get_secret(key, "") or env_val
+        if raw.startswith("op://"):
+            # A multiplexed profile scope is authoritative. Its unresolved
+            # 1Password reference must not be "resolved" from another
+            # profile's process-global environment value.
+            if _current_secret_scope() is not None:
+                scoped = _get_secret(key, "")
+                return "" if scoped.startswith("op://") else scoped
+            return env_val or raw
+        return raw or _get_secret(key, "")
 
     # Honour user suppression — `hermes auth remove <provider> <N>` for an
     # env-seeded credential marks the env:<VAR> source as suppressed so it
