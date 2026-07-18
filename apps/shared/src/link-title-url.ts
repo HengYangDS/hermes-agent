@@ -131,6 +131,7 @@ function isInIpv6Range(words: number[], network: readonly number[], prefixLength
 
 function embeddedIpv4(words: number[]): null | number {
   const isMapped = words.slice(0, 5).every(word => word === 0) && words[5] === 0xffff
+
   const isNat64Wkp =
     words[0] === 0x0064 && words[1] === 0xff9b && words.slice(2, 6).every(word => word === 0)
 
@@ -198,6 +199,7 @@ export function isPublicLinkTitleAddress(value: string): boolean {
   return ipv6 !== null && isPublicIpv6(ipv6)
 }
 
+// eslint-disable-next-line no-control-regex -- reject raw C0/DEL controls before URL parsing
 const URL_CONTROL_CHARACTER_RE = /[\u0000-\u001f\u007f]/
 const ENCODED_URL_CONTROL_CHARACTER_RE = /%(?:0[0-9a-f]|1[0-9a-f]|7f)/i
 // A pasted shell snippet such as `https://example.test/repo\\ncd repo` must

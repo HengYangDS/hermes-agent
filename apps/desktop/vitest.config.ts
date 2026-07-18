@@ -20,7 +20,11 @@ const electronNative: TestProjectConfiguration = {
   test: {
     name: 'electron',
     environment: 'node',
-    include: ['electron/**/*.test.ts', 'scripts/**.test.{ts,mjs}']
+    include: ['electron/**/*.test.ts', 'scripts/**.test.{ts,mjs}'],
+    // Vitest schedules projects with the same default sequence group together.
+    // Keep this equal to the UI pool so hosted Node 22 validation has one
+    // coherent worker contract without serializing either project.
+    maxWorkers: 4
   }
 }
 
