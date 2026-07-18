@@ -8,6 +8,10 @@ const reactUi: TestProjectConfiguration = {
     environment: 'jsdom',
     setupFiles: ['./vitest.setup.ts'],
     include: ['src/**/*.test.{ts,tsx}'],
+    // The UI suite shares jsdom/browser-shaped resources while exercising
+    // renderer persistence. Keeping a bounded worker pool avoids host-level
+    // contention without serializing the whole suite.
+    maxWorkers: 4,
     globals: true
   }
 }
