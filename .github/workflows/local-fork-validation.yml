@@ -1,0 +1,42 @@
+name: Local Fork Validation
+
+# This workflow belongs only to HengYangDS/hermes-agent.  It is intentionally
+# outside the upstream PR workflow graph: publishing it to the fork supplies a
+# zero-cost, repository-scoped check surface for exact PR commits, but it can
+# neither approve nor satisfy NousResearch's fork-workflow admission policy.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Exact immutable commit SHA to validate
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Local affected-source validation
+    runs-on: [self-hosted, Linux, ARM64, hermes-fork-validation]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install JavaScript dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Desktop affected-source contract
+        run: |
+          npm run --prefix apps/desktop typecheck
+          npm run --prefix apps/desktop test:desktop:platforms
+          npm run --prefix apps/desktop test:ui
+          npm run --prefix apps/desktop build
