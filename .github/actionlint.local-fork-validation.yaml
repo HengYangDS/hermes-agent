@@ -1,0 +1,6 @@
+self-hosted-runner:
+  labels:
+    - self-hosted
+    - Linux
+    - ARM64
+    - hermes-fork-validation
