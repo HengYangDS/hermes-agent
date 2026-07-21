@@ -33,3 +33,27 @@ run_missing_env() {
 
 run_missing_env /usr/local/bin/hermes-fork-runner-register 'RUNNER_TOKEN_FILE is required'
 run_missing_env /usr/local/bin/hermes-fork-runner-run 'RUNNER_STATE_DIR is required'
+
+volume="hermes-fork-validation-entrypoint-probe-$$"
+cleanup() {
+  docker volume rm "$volume" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT HUP INT TERM
+
+docker volume create --driver local \
+  --opt type=tmpfs --opt device=tmpfs \
+  --opt o=uid=501,gid=20,mode=0700,size=64m \
+  "$volume" >/dev/null
+
+docker run --rm --network none --read-only --user 501:20 \
+  --mount "type=volume,source=$volume,target=/runner-state,volume-nocopy" \
+  --tmpfs /tmp:rw,nosuid,nodev,size=64m \
+  --entrypoint /bin/sh "$image" -ec '
+    test "$HOME" = /runner-state/home
+    mkdir -p "$HOME"
+    cp /bin/echo "$HOME/exec-probe"
+    "$HOME/exec-probe" runner-home-exec-ok
+  ' | grep -F 'runner-home-exec-ok' >/dev/null
+
+docker volume rm "$volume" >/dev/null
+trap - EXIT HUP INT TERM
