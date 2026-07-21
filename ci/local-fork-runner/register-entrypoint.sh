@@ -1,11 +1,17 @@
 #!/bin/sh
 set -eu
 
-: "${RUNNER_TOKEN_FILE:?RUNNER_TOKEN_FILE is required}"
-: "${RUNNER_STATE_DIR:?RUNNER_STATE_DIR is required}"
-: "${RUNNER_URL:?RUNNER_URL is required}"
-: "${RUNNER_NAME:?RUNNER_NAME is required}"
-: "${RUNNER_LABELS:?RUNNER_LABELS is required}"
+require_env() {
+  name=$1
+  eval "value=\${$name-}"
+  [ -n "$value" ] || { echo "$name is required" >&2; exit 64; }
+}
+
+require_env RUNNER_TOKEN_FILE
+require_env RUNNER_STATE_DIR
+require_env RUNNER_URL
+require_env RUNNER_NAME
+require_env RUNNER_LABELS
 
 [ "$(id -u)" != 0 ] || { echo 'runner must not execute as root' >&2; exit 64; }
 [ "$RUNNER_URL" = 'https://github.com/HengYangDS/hermes-agent' ] || { echo 'runner URL is not the owned fork' >&2; exit 64; }
