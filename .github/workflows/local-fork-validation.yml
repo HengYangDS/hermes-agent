@@ -44,11 +44,13 @@ jobs:
           fetch-depth: 1
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: inputs.suite == 'desktop'
         with:
           node-version: 22
           cache: npm
 
       - name: Install JavaScript dependencies
+        if: inputs.suite == 'desktop'
         run: npm ci --ignore-scripts
 
       - name: Desktop affected-source contract
