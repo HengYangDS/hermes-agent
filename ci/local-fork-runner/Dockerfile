@@ -2,6 +2,10 @@
 # It deliberately has no host worktree, Docker socket, SSH material, or Git
 # configuration mount. Registration and job execution occur in separate
 # containers; only the former reads the short-lived registration token.
+#
+# The host's numeric UID/GID are mirrored in a non-root runner account. macOS
+# commonly uses GID 20, which already exists in the Linux base image, so group
+# creation must be conditional.
 FROM node:22-bookworm
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
@@ -14,8 +18,8 @@ ARG RUNNER_GID=10001
 RUN apt-get update \
     && apt-get install --no-install-recommends --yes ca-certificates curl git jq libicu72 libkrb5-3 liblttng-ust1 libssl3 python3 zlib1g \
     && rm -rf /var/lib/apt/lists/* \
-    && groupadd --gid "$RUNNER_GID" hermes-runner \
-    && useradd --create-home --uid "$RUNNER_UID" --gid hermes-runner --shell /bin/bash hermes-runner
+    && (getent group "$RUNNER_GID" >/dev/null || groupadd --gid "$RUNNER_GID" hermes-runner) \
+    && (getent passwd "$RUNNER_UID" >/dev/null || useradd --create-home --uid "$RUNNER_UID" --gid "$RUNNER_GID" --shell /bin/bash hermes-runner)
 
 WORKDIR /opt/actions-runner-dist
 RUN curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 \
