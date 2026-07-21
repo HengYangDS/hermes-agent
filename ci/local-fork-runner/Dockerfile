@@ -35,6 +35,9 @@ COPY run-entrypoint.sh /usr/local/bin/hermes-fork-runner-run
 RUN chmod 0755 /usr/local/bin/hermes-fork-runner-register /usr/local/bin/hermes-fork-runner-run
 
 USER ${RUNNER_UID}:${RUNNER_GID}
-ENV HOME=/tmp/home \
+# `/tmp` is deliberately mounted noexec at runtime.  Home must therefore live
+# on the private runner-state tmpfs: uv installs CPython under `$HOME`, and
+# that interpreter must be executable by the job.
+ENV HOME=/runner-state/home \
     RUNNER_ALLOW_RUNASROOT=0
 ENTRYPOINT ["/usr/local/bin/hermes-fork-runner-run"]
