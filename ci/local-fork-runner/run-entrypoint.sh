@@ -1,7 +1,10 @@
 #!/bin/sh
 set -eu
 
-: "${RUNNER_STATE_DIR:?RUNNER_STATE_DIR is required}"
+if [ -z "${RUNNER_STATE_DIR:-}" ]; then
+  echo 'RUNNER_STATE_DIR is required' >&2
+  exit 64
+fi
 [ "$(id -u)" != 0 ] || { echo 'runner must not execute as root' >&2; exit 64; }
 [ -z "${RUNNER_TOKEN_FILE:-}" ] || { echo 'registration token is forbidden during job execution' >&2; exit 64; }
 [ "$RUNNER_STATE_DIR" = '/runner-state' ] || { echo 'unexpected runner state directory' >&2; exit 64; }
