@@ -49,10 +49,10 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def require_clean_lane() -> None:
+def require_lane(*, clean: bool) -> None:
     if checked("git", "branch", "--show-current").strip() != "work/hermes-fork-local-runner-harness-20260720":
         raise RuntimeError("manager must run from its owned fork-runner work lane")
-    if checked("git", "status", "--porcelain").strip():
+    if clean and checked("git", "status", "--porcelain").strip():
         raise RuntimeError("fork-runner work lane must be clean")
 
 
@@ -216,7 +216,7 @@ def main() -> int:
     if args.status:
         print(json.dumps({"containers": containers(), "volumes": state_volumes(), "remote_runners": runner_rows()}, indent=2))
         return 0
-    require_clean_lane()
+    require_lane(clean=not args.build)
     if args.reconcile:
         reconcile(); print("reconciled owned runner residue"); return 0
     image = image_name()
