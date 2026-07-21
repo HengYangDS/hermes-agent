@@ -11,6 +11,14 @@ on:
         description: Exact immutable commit SHA to validate
         required: true
         type: string
+      suite:
+        description: Affected contract suite to run
+        required: true
+        default: desktop
+        type: choice
+        options:
+          - desktop
+          - credentials
 
 permissions:
   contents: read
@@ -21,6 +29,15 @@ jobs:
     runs-on: [self-hosted, Linux, ARM64, hermes-fork-validation]
     timeout-minutes: 45
     steps:
+      - name: Ref admission
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          case "$REF" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+            *) echo "ref must be a lowercase 40-character commit SHA" >&2; exit 64 ;;
+          esac
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ inputs.ref }}
@@ -35,8 +52,26 @@ jobs:
         run: npm ci --ignore-scripts
 
       - name: Desktop affected-source contract
+        if: inputs.suite == 'desktop'
         run: |
           npm run --prefix apps/desktop typecheck
           npm run --prefix apps/desktop test:desktop:platforms
           npm run --prefix apps/desktop test:ui
           npm run --prefix apps/desktop build
+
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        if: inputs.suite == 'credentials'
+
+      - name: Credential-isolation affected-source contract
+        if: inputs.suite == 'credentials'
+        run: |
+          uv python install 3.12
+          uv sync --locked --python 3.12 --extra all --extra dev
+          source .venv/bin/activate
+          python -m pytest \
+            tests/agent/test_credential_pool.py \
+            tests/agent/test_secret_scope.py \
+            tests/gateway/test_multiplex_credential_isolation.py \
+            tests/gateway/test_api_server_multiplex_secret_scope.py \
+            tests/gateway/test_64674_multiplex_primary_token_scope.py -v
+          ruff check agent/credential_pool.py tests/agent/test_credential_pool.py
