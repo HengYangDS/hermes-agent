@@ -4,7 +4,15 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { ProjectDialog } from './project-dialog'
 
-afterEach(cleanup)
+afterEach(async () => {
+  cleanup()
+
+  // Radix FocusScope finishes its unmount autofocus notification on the next
+  // macrotask. Let that DOM-owned event drain before Vitest moves this JSDOM
+  // environment on to another file; otherwise a delayed dispatch can cross a
+  // test-global teardown boundary and surface as an unrelated unhandled error.
+  await new Promise<void>(resolve => window.setTimeout(resolve, 0))
+})
 
 vi.mock('@/i18n', () => ({
   useI18n: () => ({
