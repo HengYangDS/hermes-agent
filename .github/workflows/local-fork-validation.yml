@@ -47,7 +47,6 @@ jobs:
         if: inputs.suite == 'desktop'
         with:
           node-version: 22
-          cache: npm
 
       - name: Install JavaScript dependencies
         if: inputs.suite == 'desktop'
