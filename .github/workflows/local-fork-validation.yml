@@ -43,6 +43,16 @@ jobs:
           ref: ${{ inputs.ref }}
           fetch-depth: 1
 
+      - name: Assert exact checkout
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          ACTUAL=$(git rev-parse HEAD)
+          [ "$ACTUAL" = "$REF" ] || {
+            echo "checkout resolved $ACTUAL, expected $REF" >&2
+            exit 65
+          }
+
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         if: inputs.suite == 'desktop'
         with:

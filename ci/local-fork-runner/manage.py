@@ -4,14 +4,18 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+from dataclasses import dataclass
 import hashlib
 import json
 import os
 from pathlib import Path
 import secrets
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 ROOT = Path(__file__).resolve().parents[2]
 CONTEXT = Path(__file__).resolve().parent
@@ -26,6 +30,52 @@ STATE_PREFIX = "hermes-fork-validation-actions-state"
 STATE_LABEL = "ai.yheng.hermes.runner-state=fork-validation"
 STATE_DESTINATION = "/runner-state"
 TOKEN_DESTINATION = "/run/secrets/runner-registration-token"
+TERMINATION_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+REMOTE_DEREGISTRATION_TIMEOUT_SECONDS = 30
+REMOTE_DEREGISTRATION_POLL_SECONDS = 2
+
+
+class RunnerInterrupted(RuntimeError):
+    """A normal termination request that must first clean owned state."""
+
+    def __init__(self, signum: int) -> None:
+        self.signum = signum
+        super().__init__(f"received {signal.Signals(signum).name}; cleaning owned runner state")
+
+
+@dataclass
+class OwnedResources:
+    volume: str | None = None
+    token: Path | None = None
+
+
+def raise_after_cleanup(signum: int, _frame: object) -> None:
+    raise RunnerInterrupted(signum)
+
+
+@contextmanager
+def interruption_guard() -> object:
+    previous = {signum: signal.getsignal(signum) for signum in TERMINATION_SIGNALS}
+    for signum in TERMINATION_SIGNALS:
+        signal.signal(signum, raise_after_cleanup)
+    try:
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
+@contextmanager
+def cleanup_signal_guard() -> object:
+    """Finish bounded cleanup after the first normal termination request."""
+    previous = {signum: signal.getsignal(signum) for signum in TERMINATION_SIGNALS}
+    for signum in TERMINATION_SIGNALS:
+        signal.signal(signum, signal.SIG_IGN)
+    try:
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
 
 
 def command(*argv: str, capture: bool = False, cwd: Path = ROOT) -> subprocess.CompletedProcess[str]:
@@ -93,6 +143,38 @@ def containers() -> list[dict[str, str]]:
     return result
 
 
+def assert_owned_container(name: str, volume: str) -> None:
+    records = json.loads(checked("docker", "inspect", name))
+    if not isinstance(records, list) or len(records) != 1 or not isinstance(records[0], dict):
+        raise RuntimeError("container inspect response is malformed")
+    record = records[0]
+    expected_user = f"{os.getuid()}:{os.getgid()}"
+    config = record.get("Config")
+    host_config = record.get("HostConfig")
+    mounts = record.get("Mounts")
+    has_expected_state = isinstance(mounts, list) and any(
+        isinstance(mount, dict)
+        and mount.get("Name") == volume
+        and mount.get("Destination") == STATE_DESTINATION
+        for mount in mounts
+    )
+    if (
+        record.get("Name") != f"/{name}"
+        or not isinstance(config, dict)
+        or config.get("User") != expected_user
+        or not isinstance(host_config, dict)
+        or host_config.get("ReadonlyRootfs") is not True
+        or not has_expected_state
+    ):
+        raise RuntimeError(f"same-named container does not have the expected owned identity: {name}")
+    if name == HOLDER and (
+        config.get("Entrypoint") != ["/bin/sh"]
+        or config.get("Cmd") != ["-c", "while :; do sleep 3600; done"]
+        or host_config.get("NetworkMode") != "none"
+    ):
+        raise RuntimeError("holder container does not have the expected owned identity")
+
+
 def state_volumes() -> list[str]:
     raw = checked("docker", "volume", "ls", "--filter", f"label={STATE_LABEL}", "--format", "{{.Name}}")
     return [line for line in raw.splitlines() if line]
@@ -114,18 +196,24 @@ def remove_volume(name: str) -> None:
     checked("docker", "volume", "rm", name)
 
 
-def reconcile() -> None:
+def reconcile(*, wait_for_offline: bool = False) -> None:
     if containers():
         raise RuntimeError("owned runner containers exist; refusing reconciliation")
-    rows = runner_rows()
-    if len(rows) > 1:
-        raise RuntimeError("more than one same-named owned runner exists")
-    if rows:
+    deadline = time.monotonic() + REMOTE_DEREGISTRATION_TIMEOUT_SECONDS
+    while True:
+        rows = runner_rows()
+        if len(rows) > 1:
+            raise RuntimeError("more than one same-named owned runner exists")
+        if not rows:
+            break
         row = rows[0]
         runner_id = assert_owned_runner(row)
-        if row.get("status") == "online" or row.get("busy") is True:
+        if row.get("status") != "online" and row.get("busy") is not True:
+            checked("gh", "api", "--method", "DELETE", f"repos/{REPOSITORY}/actions/runners/{runner_id}")
+            break
+        if not wait_for_offline or time.monotonic() >= deadline:
             raise RuntimeError("owned runner remains online or busy")
-        checked("gh", "api", "--method", "DELETE", f"repos/{REPOSITORY}/actions/runners/{runner_id}")
+        time.sleep(REMOTE_DEREGISTRATION_POLL_SECONDS)
     for volume in state_volumes():
         remove_volume(volume)
 
@@ -144,16 +232,22 @@ def ensure_image(image: str) -> None:
         raise RuntimeError("runner image build failed")
 
 
-def token_file() -> Path:
+def token_file(resources: OwnedResources) -> Path:
     payload = json.loads(checked("gh", "api", "--method", "POST", f"repos/{REPOSITORY}/actions/runners/registration-token"))
     token = payload.get("token")
     if not isinstance(token, str) or not token:
         raise RuntimeError("registration token response is malformed")
     fd, raw = tempfile.mkstemp(prefix="hermes-fork-runner-token-")
     path = Path(raw)
-    os.fchmod(fd, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(token)
+    resources.token = path
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(token)
+    except BaseException:
+        path.unlink(missing_ok=True)
+        resources.token = None
+        raise
     return path
 
 
@@ -168,28 +262,66 @@ def common(image: str, volume: str) -> list[str]:
     ]
 
 
+def stop_owned_containers(volume: str) -> None:
+    active = {row["name"] for row in containers()}
+    for name in (CONTAINER, f"{CONTAINER}-register", HOLDER):
+        if name not in active:
+            continue
+        assert_owned_container(name, volume)
+        result = command("docker", "stop", "--timeout", "5", name, capture=True)
+        if result.returncode:
+            raise RuntimeError(result.stderr.strip() or f"failed to stop owned container: {name}")
+    remaining = containers()
+    if remaining:
+        names = ", ".join(row["name"] for row in remaining)
+        raise RuntimeError(f"owned runner containers remain after cleanup: {names}")
+
+
+def cleanup_resources(resources: OwnedResources) -> None:
+    errors: list[str] = []
+    with cleanup_signal_guard():
+        if resources.token is not None:
+            resources.token.unlink(missing_ok=True)
+            resources.token = None
+        try:
+            if resources.volume is not None:
+                stop_owned_containers(resources.volume)
+        except RuntimeError as error:
+            errors.append(str(error))
+        if resources.volume is not None:
+            try:
+                if resources.volume in state_volumes():
+                    remove_volume(resources.volume)
+            except RuntimeError as error:
+                errors.append(str(error))
+            resources.volume = None
+        try:
+            reconcile(wait_for_offline=True)
+        except RuntimeError as error:
+            errors.append(str(error))
+    if errors:
+        raise RuntimeError("owned runner cleanup failed: " + "; ".join(errors))
+
+
 def once(image: str) -> int:
     if containers():
         raise RuntimeError("owned runner container is already active")
     reconcile()
-    volume = f"{STATE_PREFIX}-{secrets.token_hex(12)}"
+    resources = OwnedResources(volume=f"{STATE_PREFIX}-{secrets.token_hex(12)}")
     uid, gid = os.getuid(), os.getgid()
-    checked("docker", "volume", "create", "--driver", "local", "--label", STATE_LABEL, "--opt", "type=tmpfs", "--opt", "device=tmpfs", "--opt", f"o=uid={uid},gid={gid},mode=0700,size=8g", volume)
-    validate_volume(volume)
-    token: Path | None = None
-    holder = False
     try:
+        checked("docker", "volume", "create", "--driver", "local", "--label", STATE_LABEL, "--opt", "type=tmpfs", "--opt", "device=tmpfs", "--opt", f"o=uid={uid},gid={gid},mode=0700,size=8g", resources.volume)
+        validate_volume(resources.volume)
         checked(*[
             "docker", "run", "--detach", "--rm", "--pull", "never", "--network", "none", "--read-only",
             "--user", f"{uid}:{gid}", "--workdir", "/tmp", "--tmpfs", "/tmp:rw,nosuid,nodev,size=4g",
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true", "--pids-limit", "64", "--memory", "128m", "--cpus", "1",
-            "--mount", f"type=volume,source={volume},target={STATE_DESTINATION},volume-nocopy", "--name", HOLDER,
+            "--mount", f"type=volume,source={resources.volume},target={STATE_DESTINATION},volume-nocopy", "--name", HOLDER,
             "--entrypoint", "/bin/sh", image, "-c", "while :; do sleep 3600; done",
         ])
-        holder = True
-        token = token_file()
+        token = token_file(resources)
         register = command(*[
-            *common(image, volume), "--name", f"{CONTAINER}-register",
+            *common(image, resources.volume), "--name", f"{CONTAINER}-register",
             "--mount", f"type=bind,source={token},target={TOKEN_DESTINATION},readonly",
             "--env", f"RUNNER_TOKEN_FILE={TOKEN_DESTINATION}", "--env", f"RUNNER_URL={RUNNER_URL}",
             "--env", f"RUNNER_NAME={RUNNER_NAME}", "--env", f"RUNNER_LABELS={RUNNER_LABEL}",
@@ -197,15 +329,11 @@ def once(image: str) -> int:
         ])
         if register.returncode:
             return register.returncode
-        token.unlink(); token = None
-        return command(*[*common(image, volume), "--name", CONTAINER, image]).returncode
+        token.unlink()
+        resources.token = None
+        return command(*[*common(image, resources.volume), "--name", CONTAINER, image]).returncode
     finally:
-        if token is not None:
-            token.unlink(missing_ok=True)
-        if holder:
-            command("docker", "stop", "--time", "5", HOLDER)
-        remove_volume(volume)
-        reconcile()
+        cleanup_resources(resources)
 
 
 def main() -> int:
@@ -223,13 +351,17 @@ def main() -> int:
     ensure_image(image)
     if args.build:
         print(image); return 0
-    return once(image)
+    with interruption_guard():
+        return once(image)
 
 
 if __name__ == "__main__":
     import shutil
     try:
         raise SystemExit(main())
+    except RunnerInterrupted as error:
+        print(f"hermes fork runner interrupted safely: {error}", file=sys.stderr)
+        raise SystemExit(128 + error.signum)
     except RuntimeError as error:
         print(f"hermes fork runner failed closed: {error}", file=sys.stderr)
         raise SystemExit(1)
