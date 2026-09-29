@@ -2134,9 +2134,26 @@ def apply_terminal_config_to_env(
     if not (config is not None or "backend" in raw_terminal_cfg):
         backend_sources = backend_sources[::-1]  # env wins when the file did not set backend
     terminal_backend = str(backend_sources[0] or backend_sources[1] or "")
+    # cli.py already mirrors the live local cwd; raw config is only the
+    # fallback for surfaces that did not run that CLI projection.
+    cli_config = getattr(sys.modules.get("cli"), "CLI_CONFIG", None)
+    local_cli_cwd = (
+        env is None
+        and config is None
+        and os.environ.get("_HERMES_GATEWAY") != "1"
+        and terminal_backend == "local"
+        and isinstance(cli_config, dict)
+        and isinstance(cli_config.get("terminal"), dict)
+        and cli_config["terminal"].get("env_type") == "local"
+        and target.get("TERMINAL_CWD") == os.getcwd()
+    )
 
     for cfg_key, env_var in TERMINAL_CONFIG_ENV_MAP.items():
         if cfg_key not in terminal_cfg:
+            continue
+        if cfg_key == "cwd" and local_cli_cwd:
+            # The classic CLI has already projected its launch cwd. A later
+            # dotenv reload or terminal fallback must not undo `--in`.
             continue
         value = terminal_cfg[cfg_key]
         if not _terminal_config_value_is_bridgeable(cfg_key, value):
