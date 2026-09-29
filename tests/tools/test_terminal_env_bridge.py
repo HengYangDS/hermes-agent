@@ -85,6 +85,47 @@ def test_explicit_config_key_overrides_matching_env_value(monkeypatch):
     assert config["docker_image"] == "config/image:1"
 
 
+def test_local_cli_in_dir_survives_config_reload_and_terminal_fallback(tmp_path, monkeypatch):
+    """An explicit CLI workspace remains the local terminal's working directory."""
+    from argparse import Namespace
+
+    from hermes_cli import main as main_mod
+    from hermes_cli.cli_config_load import _mirror_config_to_env
+    from hermes_cli.env_loader import load_hermes_dotenv
+
+    configured = tmp_path / "configured"
+    requested = tmp_path / "requested"
+    configured.mkdir()
+    requested.mkdir()
+    _write_config(f"terminal:\n  backend: local\n  cwd: {configured}\n")
+    monkeypatch.chdir(configured)
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
+    monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+
+    main_mod._apply_in_dir(Namespace(in_dir=str(requested), no_restore_cwd=False))
+    _mirror_config_to_env({"terminal": {"backend": "local", "cwd": str(configured)}}, True)
+    load_hermes_dotenv(load_external_secrets=False)
+
+    assert os.environ["TERMINAL_CWD"] == str(requested)
+    assert terminal_tool._get_env_config()["cwd"] == str(requested)
+
+
+def test_gateway_local_cwd_retains_config_authority(tmp_path, monkeypatch):
+    """A gateway keeps its configured cwd even if classic CLI code was imported."""
+    from hermes_cli.cli_config_load import _mirror_config_to_env
+
+    configured = tmp_path / "configured"
+    launch = tmp_path / "launch"
+    configured.mkdir()
+    launch.mkdir()
+    _write_config(f"terminal:\n  backend: local\n  cwd: {configured}\n")
+    monkeypatch.chdir(launch)
+    _mirror_config_to_env({"terminal": {"backend": "local", "cwd": str(configured)}}, True)
+    monkeypatch.setenv("_HERMES_GATEWAY", "1")
+
+    assert terminal_tool._get_env_config()["cwd"] == str(configured)
+
+
 def test_ssh_config_preserves_remote_tilde_cwd(monkeypatch):
     """SSH ``~`` belongs to the remote user, not the Hermes host/container."""
     _write_config("terminal:\n  backend: ssh\n  cwd: '~'\n")
