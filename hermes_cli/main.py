@@ -1599,7 +1599,7 @@ def _apply_in_dir(args) -> None:
     except OSError as e:
         print(f"Error: cannot enter --in directory {in_dir}: {e}")
         sys.exit(1)
-    _explicit_in_dir = _target_dir
+    _explicit_in_dir = os.getcwd()
     # Every cwd consumer (resolve_agent_cwd -> Codex app-server thread cwd, the
     # terminal tool, context-file discovery) prefers TERMINAL_CWD over the process
     # cwd, so a value inherited from a parent surface, the shell or .env outlives

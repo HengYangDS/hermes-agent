@@ -110,6 +110,35 @@ def test_local_cli_in_dir_survives_config_reload_and_terminal_fallback(tmp_path,
     assert terminal_tool._get_env_config()["cwd"] == str(requested)
 
 
+def test_local_cli_in_symlinked_dir_survives_config_reload(tmp_path, monkeypatch):
+    """A symlink spelling of `--in` still pins the directory after chdir."""
+    from argparse import Namespace
+
+    from hermes_cli import main as main_mod
+    from hermes_cli.cli_config_load import _mirror_config_to_env
+    from hermes_cli.env_loader import load_hermes_dotenv
+
+    configured = tmp_path / "configured"
+    requested = tmp_path / "requested"
+    alias = tmp_path / "alias"
+    configured.mkdir()
+    requested.mkdir()
+    try:
+        alias.symlink_to(requested, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("directory symlinks are unavailable")
+    _write_config(f"terminal:\n  backend: local\n  cwd: {configured}\n")
+    monkeypatch.chdir(configured)
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
+    monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+
+    main_mod._apply_in_dir(Namespace(in_dir=str(alias), no_restore_cwd=False))
+    _mirror_config_to_env({"terminal": {"backend": "local", "cwd": str(configured)}}, True)
+    load_hermes_dotenv(load_external_secrets=False)
+
+    assert terminal_tool._get_env_config()["cwd"] == str(requested)
+
+
 def test_local_non_cli_bridge_keeps_configured_cwd_after_cli_import(tmp_path, monkeypatch):
     """Loading CLI code alone does not turn a dashboard launch into `--in`."""
     from hermes_cli.cli_config_load import _mirror_config_to_env
