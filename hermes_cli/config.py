@@ -2189,6 +2189,7 @@ def apply_terminal_config_to_env(
         and isinstance(cli_config, dict)
         and isinstance(cli_config.get("terminal"), dict)
         and cli_config["terminal"].get("env_type") == "local"
+        and getattr(sys.modules.get("hermes_cli.main"), "_explicit_in_dir", None) == os.getcwd()
         and target.get("TERMINAL_CWD") == os.getcwd()
     )
 

@@ -110,6 +110,27 @@ def test_local_cli_in_dir_survives_config_reload_and_terminal_fallback(tmp_path,
     assert terminal_tool._get_env_config()["cwd"] == str(requested)
 
 
+def test_local_non_cli_bridge_keeps_configured_cwd_after_cli_import(tmp_path, monkeypatch):
+    """Loading CLI code alone does not turn a dashboard launch into `--in`."""
+    from hermes_cli.cli_config_load import _mirror_config_to_env
+
+    configured = tmp_path / "configured"
+    launch = tmp_path / "launch"
+    configured.mkdir()
+    launch.mkdir()
+    _write_config(f"terminal:\n  backend: local\n  cwd: {configured}\n")
+    monkeypatch.chdir(launch)
+    monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+
+    import cli
+
+    monkeypatch.setattr(cli, "CLI_CONFIG", {"terminal": {"env_type": "local"}})
+    _mirror_config_to_env({"terminal": {"backend": "local", "cwd": str(configured)}}, True)
+
+    assert os.environ["TERMINAL_CWD"] == str(launch)
+    assert terminal_tool._get_env_config()["cwd"] == str(configured)
+
+
 def test_gateway_local_cwd_retains_config_authority(tmp_path, monkeypatch):
     """A gateway keeps its configured cwd even if classic CLI code was imported."""
     from hermes_cli.cli_config_load import _mirror_config_to_env
