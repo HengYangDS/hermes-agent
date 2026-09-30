@@ -86,34 +86,12 @@ def test_explicit_config_key_overrides_matching_env_value(monkeypatch):
 
 
 def test_local_cli_in_dir_survives_config_reload_and_terminal_fallback(tmp_path, monkeypatch):
-    """An explicit CLI workspace remains the local terminal's working directory."""
+    """An explicit CLI workspace wins over stale local terminal.cwd."""
     from argparse import Namespace
 
-    from hermes_cli import main as main_mod
-    from hermes_cli.cli_config_load import _mirror_config_to_env
-    from hermes_cli.env_loader import load_hermes_dotenv
+    from hermes_cli import _early_recovery
 
-    configured = tmp_path / "configured"
-    requested = tmp_path / "requested"
-    configured.mkdir()
-    requested.mkdir()
-    _write_config(f"terminal:\n  backend: local\n  cwd: {configured}\n")
-    monkeypatch.chdir(configured)
-    monkeypatch.delenv("TERMINAL_CWD", raising=False)
-    monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
-
-    main_mod._apply_in_dir(Namespace(in_dir=str(requested), no_restore_cwd=False))
-    _mirror_config_to_env({"terminal": {"backend": "local", "cwd": str(configured)}}, True)
-    load_hermes_dotenv(load_external_secrets=False)
-
-    assert os.environ["TERMINAL_CWD"] == str(requested)
-    assert terminal_tool._get_env_config()["cwd"] == str(requested)
-
-
-def test_local_cli_in_symlinked_dir_survives_config_reload(tmp_path, monkeypatch):
-    """A symlink spelling of `--in` still pins the directory after chdir."""
-    from argparse import Namespace
-
+    monkeypatch.setattr(_early_recovery, "restore_interrupted_pull", lambda: False)
     from hermes_cli import main as main_mod
     from hermes_cli.cli_config_load import _mirror_config_to_env
     from hermes_cli.env_loader import load_hermes_dotenv
@@ -125,22 +103,29 @@ def test_local_cli_in_symlinked_dir_survives_config_reload(tmp_path, monkeypatch
     requested.mkdir()
     try:
         alias.symlink_to(requested, target_is_directory=True)
+        selected = alias
     except (OSError, NotImplementedError):
-        pytest.skip("directory symlinks are unavailable")
+        selected = requested
     _write_config(f"terminal:\n  backend: local\n  cwd: {configured}\n")
     monkeypatch.chdir(configured)
     monkeypatch.delenv("TERMINAL_CWD", raising=False)
     monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
 
-    main_mod._apply_in_dir(Namespace(in_dir=str(alias), no_restore_cwd=False))
+    main_mod._apply_in_dir(Namespace(in_dir=str(selected), no_restore_cwd=False))
+    expected = os.getcwd()
     _mirror_config_to_env({"terminal": {"backend": "local", "cwd": str(configured)}}, True)
     load_hermes_dotenv(load_external_secrets=False)
 
-    assert terminal_tool._get_env_config()["cwd"] == str(requested)
+    assert os.environ["TERMINAL_CWD"] == expected
+    assert terminal_tool._get_env_config()["cwd"] == expected
 
 
-def test_local_non_cli_bridge_keeps_configured_cwd_after_cli_import(tmp_path, monkeypatch):
-    """Loading CLI code alone does not turn a dashboard launch into `--in`."""
+def test_local_non_cli_and_gateway_bridges_keep_configured_cwd(tmp_path, monkeypatch):
+    """A local launch without --in and a gateway retain terminal.cwd authority."""
+    from hermes_cli import _early_recovery
+
+    monkeypatch.setattr(_early_recovery, "restore_interrupted_pull", lambda: False)
+    from hermes_cli import main as main_mod
     from hermes_cli.cli_config_load import _mirror_config_to_env
 
     configured = tmp_path / "configured"
@@ -150,29 +135,19 @@ def test_local_non_cli_bridge_keeps_configured_cwd_after_cli_import(tmp_path, mo
     _write_config(f"terminal:\n  backend: local\n  cwd: {configured}\n")
     monkeypatch.chdir(launch)
     monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+    monkeypatch.setattr(main_mod, "_explicit_in_dir", None)
 
     import cli
 
     monkeypatch.setattr(cli, "CLI_CONFIG", {"terminal": {"env_type": "local"}})
     _mirror_config_to_env({"terminal": {"backend": "local", "cwd": str(configured)}}, True)
-
     assert os.environ["TERMINAL_CWD"] == str(launch)
     assert terminal_tool._get_env_config()["cwd"] == str(configured)
 
-
-def test_gateway_local_cwd_retains_config_authority(tmp_path, monkeypatch):
-    """A gateway keeps its configured cwd even if classic CLI code was imported."""
-    from hermes_cli.cli_config_load import _mirror_config_to_env
-
-    configured = tmp_path / "configured"
-    launch = tmp_path / "launch"
-    configured.mkdir()
-    launch.mkdir()
-    _write_config(f"terminal:\n  backend: local\n  cwd: {configured}\n")
-    monkeypatch.chdir(launch)
-    _mirror_config_to_env({"terminal": {"backend": "local", "cwd": str(configured)}}, True)
+    monkeypatch.setattr(terminal_tool, "_terminal_config_bridge_attempted", False)
+    monkeypatch.setenv("TERMINAL_CWD", str(launch))
     monkeypatch.setenv("_HERMES_GATEWAY", "1")
-
+    monkeypatch.setattr(main_mod, "_explicit_in_dir", str(launch))
     assert terminal_tool._get_env_config()["cwd"] == str(configured)
 
 
