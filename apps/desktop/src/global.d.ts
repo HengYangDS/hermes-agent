@@ -1532,4 +1532,7 @@ export interface HermesSelectPathsOptions {
 export interface BackendExit {
   code: number | null
   signal: string | null
+  error?: string
+  /** The native supervisor refused further automatic starts. */
+  recoveryExhausted?: boolean
 }

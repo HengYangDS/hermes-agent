@@ -1568,7 +1568,13 @@ let softRehomeInProgress = false
 // re-home, a quit, or a latched boot failure.
 let primaryStartsInFlight = 0
 let primaryRecoverySuppressed = false
-const primaryExitRecovery = createBackendExitRecoveryLatch()
+
+const primaryExitRecovery = createBackendExitRecoveryLatch({
+  onCrashLoop: error => {
+    backendStartFailure ??= error
+  }
+})
+
 // Additional per-profile backends, keyed by profile name. The PRIMARY backend
 // (the desktop's launch profile) stays managed by backendConnectionState +
 // startHermes(); this pool only holds EXTRA profile
@@ -11320,6 +11326,7 @@ function stopBackendChild(child) {
 function resetHermesConnection({ soft = false } = {}) {
   backendStartFailure = null
   remoteReauthFailure = null
+  primaryExitRecovery.resetForRecovery()
   remoteLiveness.clear()
   // The next startHermes() re-reads active-profile.json for its launch profile.
   primaryProfilePin.clear()
@@ -13203,15 +13210,14 @@ function primaryRecoveryState() {
 }
 
 function reportPrimaryRecoveryCrashLoop(code: number | null, signal: string | null): boolean {
-  if (!primaryExitRecovery.isCrashLooping()) {
+  if (!primaryExitRecovery.isCrashLooping() || !backendStartFailure) {
     return false
   }
 
-  const message =
-    'Hermes backend keeps crashing right after it restarts; not restarting it again. Relaunch Hermes Desktop.'
+  const message = backendStartFailure.message
 
   rememberLog(`[supervisor] ${message}`)
-  sendBackendExit({ code, signal, error: message })
+  sendBackendExit({ code, signal, error: message, recoveryExhausted: true })
 
   return true
 }

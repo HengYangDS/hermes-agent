@@ -28,12 +28,15 @@ export type BackendExitRecoveryOptions = {
   maxRespawns?: number
   windowMs?: number
   now?: () => number
+  /** Publish terminal exhaustion into the native startup failure boundary. */
+  onCrashLoop?: (error: Error) => void
 }
 
 export function createBackendExitRecoveryLatch({
   maxRespawns = 3,
   windowMs = 120_000,
-  now = Date.now
+  now = Date.now,
+  onCrashLoop
 }: BackendExitRecoveryOptions = {}) {
   let claimed = false
   let respawnedAt: number[] = []
@@ -49,12 +52,22 @@ export function createBackendExitRecoveryLatch({
 
     const at = now()
     respawnedAt = respawnedAt.filter(t => at - t < windowMs)
-    crashLooping = respawnedAt.length >= maxRespawns
+    const exhausted = respawnedAt.length >= maxRespawns
 
-    if (crashLooping) {
+    if (exhausted) {
+      if (!crashLooping) {
+        crashLooping = true
+        onCrashLoop?.(
+          new Error(
+            'Hermes backend keeps crashing right after it restarts; automatic recovery stopped. Restart Hermes to try again.'
+          )
+        )
+      }
+
       return false
     }
 
+    crashLooping = false
     respawnedAt.push(at)
     claimed = true
 
@@ -92,6 +105,12 @@ export function createBackendExitRecoveryLatch({
     },
     reset(): void {
       claimed = false
+    },
+    /** An explicit native reset/repair starts a new budget; ready alone does not. */
+    resetForRecovery(): void {
+      claimed = false
+      respawnedAt = []
+      crashLooping = false
     }
   }
 }

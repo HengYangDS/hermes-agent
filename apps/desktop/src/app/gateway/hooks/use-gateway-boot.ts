@@ -63,7 +63,7 @@ import {
   registerGatewaySwitchLifecycle
 } from '@/store/gateway-switch'
 import { watchLocalRuntimeJobs } from '@/store/local-runtime-jobs'
-import { notify, notifyError, RECOVERY_ACTIONS } from '@/store/notifications'
+import { dismissNotification, notify, notifyError, RECOVERY_ACTIONS } from '@/store/notifications'
 import { loadPoolLimits } from '@/store/pool-limits'
 import {
   $activeGatewayProfile,
@@ -71,7 +71,6 @@ import {
   refreshActiveProfile,
   touchActiveGatewayBackend
 } from '@/store/profile'
-import { requestBackendRestart } from '@/store/recovery-requests'
 import {
   $activeSessionId,
   $connection,
@@ -298,6 +297,20 @@ export function useGatewayBoot({
     let reauthNotified = false
     // After boot, a primary auth failure must not cover a healthy secondary.
     let primaryReauthError: string | null = null
+    // The primary transport owns its descriptor independently of the active
+    // foreground route, which may be a healthy secondary with the same name.
+    let primaryConnection: HermesConnection | null = null
+    let primaryRecoveryExhausted = false
+    let primaryRecoveryEpoch = 0
+    let restartingPrimary = false
+    let backendExitNotificationId: string | null = null
+
+    const clearBackendExitNotification = () => {
+      if (backendExitNotificationId !== null) {
+        dismissNotification(backendExitNotificationId)
+        backendExitNotificationId = null
+      }
+    }
 
     const syncPrimaryReauthError = () => {
       if (!bootCompleted || !primaryReauthError) {
@@ -383,7 +396,14 @@ export function useGatewayBoot({
     }
 
     const attemptReconnect = async (manual?: { profile: string; activationEpoch: number }) => {
-      if (cancelled || primaryReauthError || reconnecting || gatewayOpen() || $gatewaySwitching.get()) {
+      if (
+        cancelled ||
+        primaryRecoveryExhausted ||
+        primaryReauthError ||
+        reconnecting ||
+        gatewayOpen() ||
+        $gatewaySwitching.get()
+      ) {
         return
       }
 
@@ -403,21 +423,24 @@ export function useGatewayBoot({
           'Timed out revalidating the gateway connection'
         ).catch(() => undefined)
 
-        // Primary sleep/wake reconnect must dial the WINDOW-owned primary backend
-        // (same as boot/softSwitch). Passing $activeGatewayProfile would retarget
-        // this primary socket at a secondary profile's backend after a live swap.
-        // Secondaries reconnect via reconnectSecondaryGateways().
+        if (cancelled || primaryRecoveryExhausted) {
+          return
+        }
+
+        // Profile-less IPC follows the published foreground route. Resolve
+        // this primary transport's captured route, never that presentation.
         const conn = await withTimeout(
-          desktop.getConnection(),
+          getPrimaryBackend(),
           RECONNECT_ATTEMPT_TIMEOUT_MS,
           'Timed out reconnecting to Hermes backend'
         )
 
-        setPrimaryGatewayConnection(conn)
-
-        if (cancelled) {
+        if (cancelled || primaryRecoveryExhausted) {
           return
         }
+
+        primaryConnection = conn
+        setPrimaryGatewayConnection(conn)
 
         // Only publish the primary descriptor when the primary is active.
         // Otherwise a background-profile view would inherit the primary's
@@ -440,9 +463,13 @@ export function useGatewayBoot({
           'Timed out re-minting the gateway WebSocket URL'
         )
 
+        if (cancelled || primaryRecoveryExhausted) {
+          return
+        }
+
         await gateway.connect(wsUrl)
 
-        if (cancelled) {
+        if (cancelled || primaryRecoveryExhausted) {
           return
         }
 
@@ -468,8 +495,9 @@ export function useGatewayBoot({
         // busy:false — clear them or the sidebar running arc lies forever
         // (#53902/#73082). A genuinely live turn re-asserts busy on its next
         // post-reconnect event.
-        // A manual retry may finish after the user has moved to another route.
-        if (!manual || (isActivePrimary() && gatewayActivationEpoch() === manual.activationEpoch)) {
+        // A background primary says nothing about the foreground secondary's
+        // busy state or caches. Manual retries also guard their activation epoch.
+        if (isActivePrimary() && (!manual || gatewayActivationEpoch() === manual.activationEpoch)) {
           reconcileBusyStatesOnReconnect()
           await callbacksRef.current.refreshHermesConfig().catch(() => undefined)
           await callbacksRef.current.refreshSessions().catch(() => undefined)
@@ -505,7 +533,13 @@ export function useGatewayBoot({
       } finally {
         reconnecting = false
 
-        if (!cancelled && !primaryReauthError && !gatewayOpen() && !$gatewaySwitching.get()) {
+        if (
+          !cancelled &&
+          !primaryRecoveryExhausted &&
+          !primaryReauthError &&
+          !gatewayOpen() &&
+          !$gatewaySwitching.get()
+        ) {
           if (reconnectFailingSince === null) {
             reconnectFailingSince = Date.now()
           }
@@ -535,6 +569,7 @@ export function useGatewayBoot({
     function scheduleReconnect(manual?: { profile: string; activationEpoch: number }) {
       if (
         cancelled ||
+        primaryRecoveryExhausted ||
         primaryReauthError ||
         reconnecting ||
         reconnectTimer !== null ||
@@ -554,6 +589,55 @@ export function useGatewayBoot({
         reconnectTimer = null
         void attemptReconnect(manual)
       }, delay)
+    }
+
+    // Backend-exit belongs to Electron's primary, never whichever secondary is
+    // foreground when the toast is clicked. Its native reset clears the startup
+    // latch without an ambient shell restart, route switch or session wipe.
+    const restartPrimary = async () => {
+      if (cancelled || restartingPrimary || $gatewaySwitching.get()) {
+        return
+      }
+
+      restartingPrimary = true
+
+      const recoveryEpoch = ++primaryRecoveryEpoch
+      const ownedConnection = primaryConnection
+
+      const ownsRecovery = () =>
+        !cancelled &&
+        !$gatewaySwitching.get() &&
+        primaryRecoveryEpoch === recoveryEpoch &&
+        primaryConnection === ownedConnection
+
+      clearReconnectTimer()
+      clearLivenessReprobeTimer()
+
+      try {
+        const result = await withTimeout(
+          desktop.resetBootstrap(),
+          BACKEND_BOOT_WAIT_TIMEOUT_MS,
+          'Timed out resetting the primary Hermes backend'
+        )
+
+        if (!ownsRecovery() || !result.ok) {
+          return
+        }
+
+        primaryRecoveryExhausted = false
+        primaryReauthError = null
+        reauthNotified = false
+        gateway.close()
+        clearReconnectTimer()
+        resetReconnectBackoff()
+        await attemptReconnect()
+      } catch (error) {
+        if (!cancelled) {
+          notifyError(error, translateNow('notifications.errors.restartHermesFailed'))
+        }
+      } finally {
+        restartingPrimary = false
+      }
     }
 
     const reconnectNow = async ({ forceOpenSocket = false }: { forceOpenSocket?: boolean } = {}) => {
@@ -656,6 +740,20 @@ export function useGatewayBoot({
       return desktop.getConnection(route?.profile ?? undefined)
     }
 
+    async function getPrimaryBackend(): Promise<HermesConnection> {
+      const owned = primaryConnection
+
+      if (owned?.registryScoped && owned.connectionId) {
+        if (!desktop.getConnectionFor) {
+          throw new Error('This Desktop build cannot reconnect registry connections. Update Hermes Desktop.')
+        }
+
+        return desktop.getConnectionFor({ connectionId: owned.connectionId, profile: owned.profile })
+      }
+
+      return desktop.getConnection(normalizeProfileKey(owned?.profile ?? windowProfileOverride()))
+    }
+
     async function adoptPrimaryProfile(
       connection: HermesConnection,
       shouldPublish: () => boolean = () => true
@@ -672,6 +770,7 @@ export function useGatewayBoot({
         }
 
         const key = normalizeProfileKey(profileKey)
+        primaryConnection = { ...connection, profile: key }
         $activeGatewayProfile.set(key)
         setPrimaryGateway(gateway, key)
         void ensureGatewayForProfile(key)
@@ -680,7 +779,9 @@ export function useGatewayBoot({
           return false
         }
 
-        $activeGatewayProfile.set(normalizeProfileKey(override))
+        const key = normalizeProfileKey(override)
+        primaryConnection = { ...connection, profile: key }
+        $activeGatewayProfile.set(key)
       }
 
       return true
@@ -710,6 +811,8 @@ export function useGatewayBoot({
         return
       }
 
+      primaryRecoveryEpoch += 1
+
       let switchToken: null | ReturnType<typeof beginGatewaySwitch> = null
 
       try {
@@ -727,6 +830,7 @@ export function useGatewayBoot({
         resetReconnectBackoff()
         reauthNotified = false
         primaryReauthError = null
+        primaryRecoveryExhausted = false
         bootFailed = false
 
         gateway.close()
@@ -753,6 +857,7 @@ export function useGatewayBoot({
           return
         }
 
+        primaryConnection = conn
         publish(conn)
         setPrimaryGatewayConnection(conn)
 
@@ -998,6 +1103,7 @@ export function useGatewayBoot({
       reportPrimaryGatewayState(st)
 
       if (st === 'open') {
+        clearBackendExitNotification()
         bootSnapshotSuperseded = true
         openedAt = Date.now()
         reauthNotified = false
@@ -1261,10 +1367,18 @@ export function useGatewayBoot({
       }
     })
 
-    const offExit = desktop.onBackendExit(() => {
+    const offExit = desktop.onBackendExit(payload => {
       if ($gatewaySwitching.get()) {
         return
       }
+
+      // Terminal supervisor refusal owns automatic startup. Keep it latched
+      // across duplicate exit/wake events; only native explicit recovery lifts it.
+      if (payload?.recoveryExhausted === true) {
+        primaryRecoveryEpoch += 1
+      }
+
+      primaryRecoveryExhausted ||= payload?.recoveryExhausted === true
 
       // While the boot overlay is up it already shows the failure with its own
       // Retry, and the reconnect handler below is a no-op before boot completes
@@ -1279,23 +1393,36 @@ export function useGatewayBoot({
         return
       }
 
-      // Post-boot: the shell's restart intent recycles a local service via main
-      // (or re-dials a remote one) and does not depend on this hook's
-      // reconnect gate, unlike reconnectGateway().
-      notify({
+      // Post-boot: offer primary-owned native recovery, not the shell's ambient
+      // restart intent, which deliberately targets the foreground route.
+      clearBackendExitNotification()
+      backendExitNotificationId = notify({
         kind: 'error',
         title: translateNow('boot.errors.backendStopped'),
         message: translateNow('boot.errors.backgroundExited'),
+        detail: payload?.error,
         durationMs: 0,
         action: {
           label: translateNow('boot.errors.restartHermes'),
-          onClick: requestBackendRestart
+          onClick: () => void restartPrimary()
         },
         secondaryAction: {
           label: translateNow('boot.errors.openLogs'),
           onClick: () => void desktop.revealLogs?.().catch(() => undefined)
         }
       })
+
+      // Main has proved this backend exited, even if its old socket still
+      // looks open. Rebind through the existing bounded recovery path; a
+      // connection switch would discard the stored session and workspace.
+      gateway.close()
+      clearReconnectTimer()
+      clearLivenessReprobeTimer()
+      resetReconnectBackoff()
+
+      if (!primaryRecoveryExhausted) {
+        void attemptReconnect()
+      }
     })
 
     async function boot() {
@@ -1323,6 +1450,7 @@ export function useGatewayBoot({
         }
 
         stage = 'minting'
+        primaryConnection = conn
 
         setDesktopBootStep({
           phase: 'renderer.gateway.connect',
@@ -1458,13 +1586,19 @@ export function useGatewayBoot({
       completeDesktopBoot()
 
       if (survivor?.connection) {
-        publish(survivor.connection)
-        setPrimaryGatewayConnection(survivor.connection)
+        primaryConnection = survivor.connection
+
+        if (isActivePrimary()) {
+          publish(survivor.connection)
+          setPrimaryGatewayConnection(survivor.connection)
+        }
       }
 
-      const profile = survivor?.profile ?? $activeGatewayProfile.get()
-      $activeGatewayProfile.set(profile)
-      void ensureGatewayForProfile(profile)
+      if (isActivePrimary()) {
+        const profile = survivor?.profile ?? $activeGatewayProfile.get()
+        $activeGatewayProfile.set(profile)
+        void ensureGatewayForProfile(profile)
+      }
 
       // Mirror the current (already-open) socket state into the composer so the
       // input doesn't sit disabled after the swap.
@@ -1534,8 +1668,8 @@ export function useGatewayBoot({
       if (import.meta.hot && gateway.connectionState === 'open') {
         stashGatewaySurvivor({
           gateway,
-          profile: survivor?.profile ?? $activeGatewayProfile.get(),
-          connection: $connection.get()
+          profile: primaryConnection?.profile ?? survivor?.profile ?? normalizeProfileKey(windowProfileOverride()),
+          connection: primaryConnection
         })
 
         return

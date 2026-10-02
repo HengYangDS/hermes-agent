@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict'
 
-import { test } from 'vitest'
+import { test, vi } from 'vitest'
 
 import { createBackendConnectionState } from './backend-connection-state'
 import { createBackendExitRecoveryLatch } from './backend-exit-recovery'
+import { createLocalBackendLifecycle } from './local-backend-lifecycle'
 
 type Child = { pid: number }
 
@@ -151,4 +152,60 @@ test('a failed start that owns no recovery claim is not re-armed and spends no b
   clock += 1_000
   assert.equal(latch.claim(empty), false, 'fourth is the real budget exhaustion')
   assert.equal(latch.isCrashLooping(), true)
+})
+
+test('an exhausted supervisor budget latches ordinary startup until explicit recovery resets it', async () => {
+  let latchedFailure: Error | null = null
+
+  const onCrashLoop = vi.fn((error: Error) => {
+    latchedFailure = error
+  })
+
+  const latch = createBackendExitRecoveryLatch({ maxRespawns: 2, onCrashLoop })
+
+  const lifecycle = createLocalBackendLifecycle({
+    stopChild: () => {},
+    waitForExit: async () => {},
+    cancelSetup: () => {}
+  })
+
+  const spawn = vi.fn(() => ({}))
+
+  const start = () =>
+    lifecycle.start(async () => {
+      if (latchedFailure) {
+        throw latchedFailure
+      }
+
+      return lifecycle.spawn(spawn)
+    })
+
+  const empty = { hasCurrentOwner: false, hasPendingStart: false, intentionalTeardown: false }
+
+  for (let i = 0; i < 2; i++) {
+    assert.equal(latch.claim(empty), true)
+    const child = await start()
+    lifecycle.release(child)
+    latch.reset()
+  }
+
+  assert.equal(latch.claim(empty), false)
+  await assert.rejects(start(), /keeps crashing/)
+  assert.equal(onCrashLoop.mock.calls.length, 1)
+  assert.equal(spawn.mock.calls.length, 2)
+  latch.reset()
+  assert.equal(latch.claim(empty), false)
+  await assert.rejects(start(), /keeps crashing/)
+  assert.equal(onCrashLoop.mock.calls.length, 1, 'ordinary retries retain the same terminal failure')
+
+  // The existing native reset/repair path clears its startup failure as well
+  // as the supervisor budget. A ready transition alone must never do this.
+  latch.resetForRecovery()
+  latchedFailure = null
+  assert.equal(latch.claim(empty), true)
+  const recovered = await start()
+  lifecycle.release(recovered)
+  assert.equal(spawn.mock.calls.length, 3)
+  assert.equal(latch.isCrashLooping(), false)
+  await lifecycle.shutdown()
 })

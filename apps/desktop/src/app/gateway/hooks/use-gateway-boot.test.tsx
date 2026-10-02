@@ -27,8 +27,8 @@ import {
   endGatewaySwitch,
   recoverActiveSourceAfterFailedGatewaySwitch
 } from '@/store/gateway-switch'
-import { $notifications, clearNotifications, notifyError } from '@/store/notifications'
-import { $activeGatewayProfile, $profiles, ensureGatewayProfile } from '@/store/profile'
+import { $notifications, clearNotifications, notify, notifyError } from '@/store/notifications'
+import { $activeGatewayProfile, $profiles } from '@/store/profile'
 import { $backendRestartRequest } from '@/store/recovery-requests'
 import {
   $activeSessionId,
@@ -81,6 +81,29 @@ type Listener = (ev: unknown) => void
 let connectionApplied: null | (() => void) = null
 let powerResume: null | (() => void) = null
 let backendExit: null | ((payload?: unknown) => void) = null
+
+interface NativeWindowRoute {
+  connectionId: null | string
+  profile: string | undefined
+  registryScoped: boolean
+}
+
+// Load native routing through the test runner, not the renderer compilation
+// graph: Electron sources deliberately have their own compiler policy.
+const { resolveDesktopConnectionRequest } = await vi.importActual<{
+  resolveDesktopConnectionRequest: (
+    profile: unknown,
+    source: NativeWindowRoute | null,
+    primaryProfile: string
+  ) => { connectionId: null | string; profile: string }
+}>('../../../../electron/desktop-profile')
+
+const { WindowConnectionRouteRegistry } = await vi.importActual<{
+  WindowConnectionRouteRegistry: new () => {
+    set: (senderId: number, route: unknown) => NativeWindowRoute | null
+    get: (senderId: number) => NativeWindowRoute | null
+  }
+}>('../../../../electron/window-connection-route')
 
 describe('primaryRuntimeConnectionId', () => {
   it('uses the registry identity when the primary connection has one', () => {
@@ -259,6 +282,7 @@ function fakeDesktop() {
       }
     }),
     revalidateConnection: vi.fn(async () => ({ ok: true, rebuilt: false })),
+    resetBootstrap: vi.fn(async () => ({ ok: true })),
     onWindowStateChanged: vi.fn(() => () => undefined),
     touchBackend: vi.fn(async () => undefined),
     profile: { get: vi.fn(async () => ({ profile: 'default' })) }
@@ -1920,11 +1944,10 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     FakeWebSocket.mode = 'open'
     await advanceBackoff()
     expect(desktop.revalidateConnection).toHaveBeenCalledTimes(2)
-    // The manual reconnect dials the WINDOW-owned primary backend (no profile
-    // arg) — same contract as the sleep/wake reconnect: passing the active
-    // profile would retarget the primary socket after a live profile swap.
+    // A profile-less native request follows the sender's foreground route.
+    // The reconnect must explicitly resolve its own captured primary profile.
     const lastCall = desktop.getConnection.mock.calls.at(-1) ?? []
-    expect(lastCall.length === 0 || lastCall[0] == null || lastCall[0] === '').toBe(true)
+    expect(lastCall[0]).toBe(primaryConn.profile)
     expect(desktop.getGatewayWsUrl).toHaveBeenCalledTimes(3)
     expect(oldPrimary.readyState).toBe(FakeWebSocket.CLOSED)
     expect(backgroundSocket.readyState).toBe(FakeWebSocket.OPEN)
@@ -2070,7 +2093,10 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     expect($notifications.get()).toHaveLength(0)
   })
 
-  it('a backend exit after boot toasts a Restart that raises the shell restart intent', async () => {
+  it('a backend exit after boot offers the native primary reset rather than an ambient restart', async () => {
+    const desktop = fakeDesktop()
+
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
     render(<Harness />)
     await flushAsync()
     expect($desktopBoot.get().visible).toBe(false)
@@ -2080,8 +2106,78 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
 
     const toast = $notifications.get().find(entry => entry.kind === 'error')
     expect(toast?.action).toBeTruthy()
-    toast?.action?.onClick()
-    expect($backendRestartRequest.get()).toBe(before + 1)
+    act(() => toast?.action?.onClick())
+    await flushAsync()
+    expect(desktop.resetBootstrap).toHaveBeenCalledExactlyOnceWith()
+    expect($backendRestartRequest.get()).toBe(before)
+  })
+
+  it('a known backend exit rebinds a still-open socket without losing the stored session or unrelated notices', async () => {
+    const desktop = fakeDesktop()
+
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+    const beforeConnectionSwitch = vi.fn()
+    render(<Harness beforeConnectionSwitch={beforeConnectionSwitch} />)
+    await flushAsync()
+
+    const previousSocket = FakeWebSocket.instances.at(-1)!
+    const storedSession = 'stored-session-before-respawn'
+    setSelectedStoredSessionId(storedSession)
+    const workspace = '/workspace/retained-project'
+    $currentCwd.set(workspace)
+    const unrelatedNotice = notify({ kind: 'error', message: 'Unrelated retained error', durationMs: 0 })
+    const restartIntent = $backendRestartRequest.get()
+
+    const replacement = {
+      ...primaryConn,
+      baseUrl: 'http://127.0.0.1:47102',
+      wsUrl: 'ws://127.0.0.1:47102/api/ws?token=replacement'
+    }
+
+    desktop.getConnection.mockResolvedValue(replacement)
+    desktop.getGatewayWsUrl.mockResolvedValue(replacement.wsUrl)
+
+    act(() => backendExit?.({ code: null, signal: 'SIGTERM' }))
+    await flushAsync()
+
+    expect(previousSocket.readyState).toBe(FakeWebSocket.CLOSED)
+    expect(FakeWebSocket.instances.at(-1)?.url).toBe(replacement.wsUrl)
+    expect($gatewayState.get()).toBe('open')
+    expect($connection.get()?.baseUrl).toBe(replacement.baseUrl)
+    expect($selectedStoredSessionId.get()).toBe(storedSession)
+    expect($currentCwd.get()).toBe(workspace)
+    expect(beforeConnectionSwitch).not.toHaveBeenCalled()
+    expect($backendRestartRequest.get()).toBe(restartIntent)
+    expect($notifications.get().map(entry => entry.id)).toEqual([unrelatedNotice])
+  })
+
+  it('repeated known exits coalesce behind the current reconnect instead of multiplying recovery', async () => {
+    const desktop = fakeDesktop()
+
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+    render(<Harness />)
+    await flushAsync()
+
+    const revalidation = deferred<{ ok: boolean; rebuilt: boolean }>()
+    desktop.revalidateConnection.mockReturnValue(revalidation.promise)
+    const previousSocket = FakeWebSocket.instances.at(-1)!
+    const beforeSockets = FakeWebSocket.instances.length
+
+    act(() => {
+      backendExit?.({ signal: 'SIGTERM' })
+      backendExit?.({ signal: 'SIGTERM' })
+    })
+    await flushAsync()
+
+    expect(previousSocket.readyState).toBe(FakeWebSocket.CLOSED)
+    expect(desktop.revalidateConnection).toHaveBeenCalledTimes(1)
+    expect($notifications.get()).toHaveLength(1)
+
+    revalidation.resolve({ ok: true, rebuilt: false })
+    await flushAsync()
+    expect(FakeWebSocket.instances).toHaveLength(beforeSockets + 1)
+    expect($gatewayState.get()).toBe('open')
+    expect($notifications.get()).toHaveLength(0)
   })
 
   it('seeds the configured default project dir pre-connect — no route-resume race (#71873)', async () => {
@@ -2128,48 +2224,228 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     expect($currentCwd.get()).toBe('C:\\Hermes')
   })
 
-  it('FIX: primary sleep/wake reconnect dials the window backend, not the active secondary profile', async () => {
+  it('a primary backend exit preserves its native route while a same-named secondary stays foreground', async () => {
     const desktop = fakeDesktop()
+    const primary = { ...remotePrimaryConn, authMode: 'oauth' as const, registryScoped: true }
+    const secondary = { ...coderConn, profile: primary.profile, registryScoped: true }
+    const routes = new WindowConnectionRouteRegistry()
+    const senderId = 1
+    routes.set(senderId, primary)
+    const freshPrimaryUrl = `${primary.baseUrl.replace('https:', 'wss:')}/api/ws?ticket=primary-fresh`
+    const freshSecondaryUrl = `${secondary.baseUrl.replace('https:', 'wss:')}/api/ws?ticket=secondary-fresh`
+
+    const resolveRoute = (connectionId: null | string | undefined) =>
+      connectionId === secondary.connectionId ? secondary : primary
+
+    desktop.getConnection.mockImplementation(async profile =>
+      resolveRoute(resolveDesktopConnectionRequest(profile, routes.get(senderId), primary.profile).connectionId)
+    )
+
+    const getConnectionFor = vi.fn(async ({ connectionId }: { connectionId?: null | string }) =>
+      resolveRoute(connectionId)
+    )
+
+    const getGatewayWsUrlFor = vi.fn(async ({ connectionId }: { connectionId?: null | string }) =>
+      connectionId === secondary.connectionId ? freshSecondaryUrl : freshPrimaryUrl
+    )
+
+    Object.assign(desktop, {
+      getConnectionFor,
+      getGatewayWsUrlFor,
+      setActiveConnectionRoute: (route: unknown) => routes.set(senderId, route)
+    })
 
     ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
 
-    render(<Harness />)
+    const view = render(<Harness />)
     await flushAsync()
     expect($gatewayState.get()).toBe('open')
     expect(FakeWebSocket.instances).toHaveLength(1)
-    expect(FakeWebSocket.instances[0].url).toBe(primaryConn.wsUrl)
+    expect(FakeWebSocket.instances[0].url).toBe(freshPrimaryUrl)
 
-    // Profile swap opens a secondary WS; briefly use real timers so that
-    // handshake isn't wedged behind the suite's fake clock.
-    vi.useRealTimers()
-    await ensureGatewayProfile('coder')
-    vi.useFakeTimers()
+    let activation!: Promise<boolean>
+    act(() => {
+      activation = ensureGatewayForAgent(secondary.connectionId, secondary.profile)
+    })
+    await flushAsync()
+    expect(await activation).toBe(true)
 
     expect(isActivePrimary()).toBe(false)
-    expect($activeGatewayProfile.get()).toBe('coder')
-    expect($connection.get()?.profile).toBe('coder')
-    expect($connection.get()?.baseUrl).toBe(coderConn.baseUrl)
+    expect(routes.get(senderId)?.connectionId).toBe(secondary.connectionId)
+    expect($connection.get()?.baseUrl).toBe(secondary.baseUrl)
+    const secondaryGateway = activeGateway()
+    const secondarySocket = FakeWebSocket.instances.at(-1)!
+    $sessionTiles.set([
+      {
+        storedSessionId: 'secondary-stored-session',
+        runtimeId: 'secondary-live-runtime',
+        workspaceMode: 'bots',
+        workspaceOwnerKey: `${secondary.connectionId}::${secondary.profile}`,
+        ownerRoute: { connectionId: secondary.connectionId, profile: secondary.profile }
+      }
+    ])
+    setSelectedStoredSessionId('secondary-stored-session')
+    $busy.set(true)
+    $awaitingResponse.set(true)
+    const preservedTile = $sessionTiles.get()[0]
 
     const callsBeforeDrop = desktop.getConnection.mock.calls.length
+    const scopedCallsBeforeDrop = getConnectionFor.mock.calls.length
+    const mintsBeforeDrop = getGatewayWsUrlFor.mock.calls.length
     const socketsBeforeDrop = FakeWebSocket.instances.length
     const primarySocket = FakeWebSocket.instances[0]
 
-    act(() => primarySocket.drop())
+    act(() => backendExit?.({ code: null, signal: 'SIGTERM' }))
     await flushAsync()
-    await advanceBackoff()
 
-    const reconnectCalls = desktop.getConnection.mock.calls.slice(callsBeforeDrop)
-    expect(reconnectCalls.some(args => (args[0] ?? '').trim() === 'coder')).toBe(false)
-    expect(reconnectCalls.some(args => args.length === 0 || args[0] == null || args[0] === '')).toBe(true)
+    expect(primarySocket.readyState).toBe(FakeWebSocket.CLOSED)
+    expect(desktop.getConnection.mock.calls.slice(callsBeforeDrop)).toEqual([])
+    expect(getConnectionFor.mock.calls.slice(scopedCallsBeforeDrop)).toEqual([
+      [{ connectionId: primary.connectionId, profile: primary.profile }]
+    ])
+    expect(getGatewayWsUrlFor.mock.calls.slice(mintsBeforeDrop)).toEqual([
+      [{ connectionId: primary.connectionId, profile: primary.profile }]
+    ])
+    expect(FakeWebSocket.instances.slice(socketsBeforeDrop).map(socket => socket.url)).toEqual([freshPrimaryUrl])
+    expect(activeGateway()).toBe(secondaryGateway)
+    expect(secondarySocket.readyState).toBe(FakeWebSocket.OPEN)
+    expect($sessionTiles.get()[0]).toBe(preservedTile)
+    expect($selectedStoredSessionId.get()).toBe('secondary-stored-session')
+    expect($busy.get()).toBe(true)
+    expect($awaitingResponse.get()).toBe(true)
+    expect($connection.get()?.baseUrl).toBe(secondary.baseUrl)
+    expect(routes.get(senderId)?.connectionId).toBe(secondary.connectionId)
 
-    const primaryReconnectSockets = FakeWebSocket.instances
-      .slice(socketsBeforeDrop)
-      .filter(socket => socket.url === primaryConn.wsUrl)
+    await ensureGatewayForAgent(primary.connectionId, primary.profile)
+    expect(isActivePrimary()).toBe(true)
+    expect(activeGateway()?.connectionState).toBe('open')
+    expect(FakeWebSocket.instances).toHaveLength(socketsBeforeDrop + 1)
+    await ensureGatewayForAgent(secondary.connectionId, secondary.profile)
+    expect(activeGateway()).toBe(secondaryGateway)
+    expect(secondarySocket.readyState).toBe(FakeWebSocket.OPEN)
 
-    expect(primaryReconnectSockets.length).toBeGreaterThan(0)
-    expect($connection.get()?.profile).toBe('coder')
-    expect($connection.get()?.baseUrl).toBe(coderConn.baseUrl)
+    // A native dev remount must retain the transport's A identity, not stash
+    // foreground B as the primary merely because B was last published.
+    view.unmount()
+    render(<Harness />)
+    await flushAsync()
+    expect(activeGateway()).toBe(secondaryGateway)
+    expect($connection.get()?.connectionId).toBe(secondary.connectionId)
+    const socketsBeforeReturn = FakeWebSocket.instances.length
+
+    // The primary's terminal recovery action must call its native reset,
+    // never the shell's ambient restart of whichever route is foreground.
+    const restartIntent = $backendRestartRequest.get()
+    act(() => backendExit?.({ code: 1, signal: null, recoveryExhausted: true }))
+    await flushAsync()
+    act(() =>
+      $notifications
+        .get()
+        .find(entry => entry.kind === 'error')
+        ?.action?.onClick()
+    )
+    await flushAsync()
+    expect(desktop.resetBootstrap).toHaveBeenCalledExactlyOnceWith()
+    expect($backendRestartRequest.get()).toBe(restartIntent)
+    expect(activeGateway()).toBe(secondaryGateway)
+    expect(secondarySocket.readyState).toBe(FakeWebSocket.OPEN)
+    expect($sessionTiles.get()[0]).toBe(preservedTile)
+    expect($connection.get()?.connectionId).toBe(secondary.connectionId)
+    expect(FakeWebSocket.instances.at(-1)?.url).toBe(freshPrimaryUrl)
+    expect($notifications.get()).toHaveLength(0)
+    await ensureGatewayForAgent(primary.connectionId, primary.profile)
+    expect(isActivePrimary()).toBe(true)
+    expect(FakeWebSocket.instances).toHaveLength(socketsBeforeReturn + 1)
   })
+
+  it('terminal supervisor exhaustion stops automatic reconnect and keeps explicit recovery available', async () => {
+    const desktop = fakeDesktop()
+
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+    render(<Harness />)
+    await flushAsync()
+    const primarySocket = FakeWebSocket.instances[0]
+    const requestsBeforeExit = desktop.getConnection.mock.calls.length
+    const restartIntent = $backendRestartRequest.get()
+    const failure = 'The primary backend exhausted its automatic recovery budget.'
+
+    act(() => backendExit?.({ code: 1, signal: null, error: failure, recoveryExhausted: true }))
+    await flushAsync()
+    expect(primarySocket.readyState).toBe(FakeWebSocket.CLOSED)
+    expect(desktop.getConnection).toHaveBeenCalledTimes(requestsBeforeExit)
+    expect(FakeWebSocket.instances).toHaveLength(1)
+    expect($notifications.get()).toHaveLength(1)
+    expect($notifications.get()[0].detail).toBe(failure)
+
+    act(() => {
+      backendExit?.({ code: 1, signal: null })
+      powerResume?.()
+    })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000)
+    })
+    expect(desktop.getConnection).toHaveBeenCalledTimes(requestsBeforeExit)
+    expect($notifications.get()).toHaveLength(1)
+
+    act(() => $notifications.get()[0].action?.onClick())
+    await flushAsync()
+    expect(desktop.resetBootstrap).toHaveBeenCalledExactlyOnceWith()
+    expect($backendRestartRequest.get()).toBe(restartIntent)
+    expect($gatewayState.get()).toBe('open')
+    expect($notifications.get()).toHaveLength(0)
+  })
+
+  it.each(['connection switch', 'new exhaustion'] as const)(
+    'a deferred primary reset cannot override a newer %s',
+    async newer => {
+      const desktop = fakeDesktop()
+      const reset = deferred<{ ok: boolean }>()
+      desktop.resetBootstrap.mockReturnValue(reset.promise)
+
+      ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+      render(<Harness />)
+      await flushAsync()
+      act(() => backendExit?.({ code: 1, signal: null, recoveryExhausted: true }))
+      await flushAsync()
+      act(() => $notifications.get()[0].action?.onClick())
+      await flushAsync()
+      expect(desktop.resetBootstrap).toHaveBeenCalledTimes(1)
+
+      if (newer === 'connection switch') {
+        const replacement = {
+          ...primaryConn,
+          connectionId: 'new-primary',
+          baseUrl: 'https://new-primary.example.com',
+          wsUrl: 'wss://new-primary.example.com/api/ws?token=new'
+        }
+
+        desktop.getConnection.mockResolvedValue(replacement)
+        desktop.getGatewayWsUrl.mockResolvedValue(replacement.wsUrl)
+        act(() => connectionApplied?.())
+        await flushAsync()
+        expect($gatewayState.get()).toBe('open')
+        expect($connection.get()?.connectionId).toBe(replacement.connectionId)
+      } else {
+        act(() => backendExit?.({ code: 1, signal: null, error: 'New terminal exhaustion', recoveryExhausted: true }))
+        await flushAsync()
+      }
+
+      const currentSocket = FakeWebSocket.instances.at(-1)!
+      const currentState = currentSocket.readyState
+      const currentConnection = $connection.get()
+      const socketCount = FakeWebSocket.instances.length
+      const connectionCalls = desktop.getConnection.mock.calls.length
+      const notices = $notifications.get()
+      reset.resolve({ ok: true })
+      await flushAsync()
+
+      expect(currentSocket.readyState).toBe(currentState)
+      expect($connection.get()).toBe(currentConnection)
+      expect(FakeWebSocket.instances).toHaveLength(socketCount)
+      expect(desktop.getConnection).toHaveBeenCalledTimes(connectionCalls)
+      expect($notifications.get()).toBe(notices)
+    }
+  )
 
   it('FIX #82679: a transient remote boot failure self-heals — the next attempt rebuilds the dropped connection', async () => {
     // The reported class: the app relaunches (or wakes) against a registered
