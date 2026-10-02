@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { exec as execCallback } from 'node:child_process'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
@@ -259,38 +259,48 @@ test('update-all deduplicates the same recovery scope and keeps primary preceden
   )
 })
 
-test('POSIX managed launcher executes the updater command and atomically publishes its status', async () => {
-  const home = await mkdtemp(path.join(os.tmpdir(), 'hermes-managed-launch-'))
+test.skipIf(process.platform === 'win32')(
+  'POSIX managed launcher executes the updater command and atomically publishes its status',
+  async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), 'hermes-managed-launch-'))
 
-  try {
-    const command = buildPosixManagedUpdateLaunch(
-      {
-        ssh: { exec: async () => '' },
-        platform: 'Linux',
-        hermesPath: '/bin/true',
-        hermesHome: home
-      },
-      CORRELATION
-    )
+    try {
+      const launcher = path.join(home, 'synthetic-hermes')
+      const executionPath = path.join(home, 'executed-command')
 
-    const { stdout } = await exec(command, { shell: '/bin/sh' })
-    const statusPath = path.join(home, `.update_exit_code.${CORRELATION}`)
-    let status = ''
+      await writeFile(launcher, '#!/bin/sh\nprintf "%s\\n" "$@" > "$HERMES_HOME/executed-command"\nexit 0\n')
+      await chmod(launcher, 0o700)
 
-    for (let attempt = 0; attempt < 50 && !status; attempt += 1) {
-      try {
-        status = await readFile(statusPath, 'utf8')
-      } catch {
-        await new Promise(resolve => setTimeout(resolve, 10))
+      const command = buildPosixManagedUpdateLaunch(
+        {
+          ssh: { exec: async () => '' },
+          platform: process.platform === 'darwin' ? 'Darwin' : 'Linux',
+          hermesPath: launcher,
+          hermesHome: home
+        },
+        CORRELATION
+      )
+
+      const { stdout } = await exec(command, { shell: '/bin/sh' })
+      const statusPath = path.join(home, `.update_exit_code.${CORRELATION}`)
+      let status = ''
+
+      for (let attempt = 0; attempt < 50 && !status; attempt += 1) {
+        try {
+          status = await readFile(statusPath, 'utf8')
+        } catch {
+          await new Promise(resolve => setTimeout(resolve, 10))
+        }
       }
-    }
 
-    assert.match(stdout, /MANAGED_UPDATE_STARTED/)
-    assert.equal(status, '0')
-  } finally {
-    await rm(home, { force: true, recursive: true })
+      assert.match(stdout, /MANAGED_UPDATE_STARTED/)
+      assert.equal(status, '0')
+      assert.equal(await readFile(executionPath, 'utf8'), 'update\n--yes\n')
+    } finally {
+      await rm(home, { force: true, recursive: true })
+    }
   }
-})
+)
 
 test('Windows managed launcher starts a hidden child and leaves exit 75 to the external coordinator', () => {
   const command = buildWindowsManagedUpdateLaunch(
