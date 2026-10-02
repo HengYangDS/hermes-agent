@@ -4,6 +4,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 
@@ -30,6 +31,7 @@ def test_compute_host_line_json_hello_and_shutdown():
     repo = Path(__file__).resolve().parents[2]
     env = dict(os.environ)
     env["PYTHONPATH"] = str(repo) + os.pathsep + env.get("PYTHONPATH", "")
+    started = time.monotonic()
     proc = subprocess.Popen(
         [sys.executable, "-m", "tui_gateway.compute_host"],
         cwd=str(repo),
@@ -43,7 +45,10 @@ def test_compute_host_line_json_hello_and_shutdown():
     assert proc.stdin is not None
     out = _stdout_queue(proc)
     try:
-        hello = _read_json_line(out)
+        # The shipped supervisor admits this same cold startup for at most ten seconds.
+        hello = _read_json_line(
+            out, timeout=max(0.001, 10.0 - (time.monotonic() - started))
+        )
         assert hello["type"] == "hello"
         assert hello["host_pid"] == proc.pid
 
@@ -58,5 +63,11 @@ def test_compute_host_line_json_hello_and_shutdown():
         assert _read_json_line(out)["type"] == "shutdown.ack"
         proc.wait(timeout=2)
     finally:
-        if proc.poll() is None:
-            proc.kill()
+        try:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=2)
+        finally:
+            for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                if pipe is not None:
+                    pipe.close()

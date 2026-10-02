@@ -162,6 +162,15 @@ identity are not assumed to match a newly selected provider; their old endpoint 
 cannot override the new provider's resolved route. A known same-provider selection retains its
 explicit session endpoint and wire-mode override.
 
+Desktop and TUI sessions keep the selected route identity in their existing persisted
+`model_config.provider`, independently of the resolved billing class. An explicit native
+`requested_provider` takes precedence over endpoint lookup: two named routes may share one
+URL while using different transports. Ordinary turns persist the built route before inference;
+one-turn model overrides do not replace that durable choice. The same identity feeds live
+session information, resume, model-switch preflight and one-turn restoration. Metadata-only
+reads do not hydrate external secret sources. Legacy bare custom identities retain the existing
+lookup behavior and remain unresolved when no configured route matches.
+
 Codex uses a separate Responses API path:
 
 - `api_mode = codex_responses`

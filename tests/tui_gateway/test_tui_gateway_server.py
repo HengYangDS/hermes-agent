@@ -9838,6 +9838,7 @@ def test_config_set_model_recovers_failed_profile_resume_after_build_completes(
         return types.SimpleNamespace(
             model=override["model"],
             provider="custom",
+            requested_provider=override["provider"],
             base_url=override["base_url"],
             api_key=override["api_key"],
             api_mode=override["api_mode"],
@@ -9917,9 +9918,7 @@ def test_config_set_model_recovers_failed_profile_resume_after_build_completes(
             "secrets": {"PROFILE_API_KEY": "profile-secret"},
             "base_url": profile_url,
             "api_key": "profile-secret",
-            "current_provider": (
-                "custom:new-provider" if provider_flag else "custom"
-            ),
+            "current_provider": seen["build"]["overrides"]["model_override"]["provider"],
             "current_api_key": "profile-secret" if not provider_flag else "",
         }
         assert seen["build"]["home"] == profile_home
@@ -9929,6 +9928,7 @@ def test_config_set_model_recovers_failed_profile_resume_after_build_completes(
         overrides = seen["build"]["overrides"]
         assert overrides["model_override"] == session["model_override"]
         assert overrides["provider_override"] == "custom:new-provider"
+        assert overrides["model_override"]["provider"] == overrides["provider_override"]
         assert overrides["reasoning_config_override"] == reasoning
         assert session["agent_error"] is None
         assert session["agent"].model == "new/model"

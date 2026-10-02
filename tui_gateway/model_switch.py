@@ -17,7 +17,9 @@ _RUNTIME_KEYS = ("model", "provider", "api_key", "base_url", "api_mode")
 
 def _snapshot_agent_model_runtime(agent) -> dict:
     """Capture the current agent model runtime for a one-turn restore."""
+    from .session_identity import agent_provider_identity
     return {**{k: getattr(agent, k, "") for k in _RUNTIME_KEYS},
+            "provider": agent_provider_identity(agent),
             "reasoning_config": copy.deepcopy(getattr(agent, "reasoning_config", None)),
             "primary_runtime": copy.deepcopy(getattr(agent, "_primary_runtime", None))}
 
@@ -198,8 +200,9 @@ def _switch_request(raw_input: str, parsed_flags, persist_override) -> tuple[str
 def _current_model_runtime(agent, explicit_provider: str) -> tuple:
     """(provider, model, base_url, api_key) to switch from: live agent, else configured runtime."""
     if agent:
-        return tuple(
-            getattr(agent, k, "") or "" for k in ("provider", "model", "base_url", "api_key"))
+        from .session_identity import agent_provider_identity
+        return (agent_provider_identity(agent), *(
+            getattr(agent, k, "") or "" for k in ("model", "base_url", "api_key")))
     current_model = _resolve_model()
     if explicit_provider:
         return explicit_provider.strip(), current_model, "", ""
@@ -210,7 +213,7 @@ def _current_model_runtime(agent, explicit_provider: str) -> tuple:
     key = runtime.get("api_key", "")
     if not (callable(key) and not isinstance(key, str)):
         key = str(key or "")
-    provider = str(runtime.get("provider", "") or "")
+    provider = str(runtime.get("requested_provider") or runtime.get("provider") or "")
     return provider, current_model, str(runtime.get("base_url", "") or ""), key
 
 
