@@ -201,7 +201,13 @@ class SessionManager:
         if original is None:
             return None
         new_id = str(uuid.uuid4())
-        agent = self._make_agent(session_id=new_id, cwd=cwd, model=original.model or None)
+        agent = self._make_agent(
+            session_id=new_id, cwd=cwd, model=original.model or None,
+            requested_provider=(getattr(original.agent, "requested_provider", None)
+                                or getattr(original.agent, "provider", None)),
+            base_url=getattr(original.agent, "base_url", None),
+            api_mode=getattr(original.agent, "api_mode", None),
+        )
         model = getattr(agent, "model", original.model) or original.model
         state = self._install_state(new_id, agent, cwd, model, copy.deepcopy(original.history))
         logger.info("Forked ACP session %s -> %s", session_id, new_id)
@@ -324,6 +330,9 @@ class SessionManager:
             value = getattr(state.agent, key, None)
             if isinstance(value, str) and value.strip():
                 session_meta[key] = value.strip()
+        requested = getattr(state.agent, "requested_provider", None)
+        if isinstance(requested, str) and requested.strip() and requested.strip() != session_meta.get("provider"):
+            session_meta["requested_provider"] = requested.strip()
 
         try:
             if db.get_session(state.session_id) is None:
@@ -442,7 +451,8 @@ class SessionManager:
         try:
             agent = self._make_agent(
                 session_id=session_id, cwd=cwd, model=model, api_mode=meta.get("api_mode") or None,
-                requested_provider=meta.get("provider") or row.get("billing_provider"),
+                requested_provider=(meta.get("requested_provider") or meta.get("provider")
+                                    or row.get("billing_provider")),
                 base_url=meta.get("base_url") or row.get("billing_base_url"))
         except Exception:
             logger.warning("Failed to recreate agent for ACP session %s", session_id, exc_info=True)
@@ -503,6 +513,8 @@ class SessionManager:
                 requested=requested_provider or config_provider, target_model=(model or default_model) or None)
             kwargs.update({
                 "provider": runtime.get("provider"), "api_mode": api_mode or runtime.get("api_mode"),
+                "requested_provider": (runtime.get("requested_provider") or requested_provider
+                                       or config_provider or runtime.get("provider")),
                 "base_url": base_url or runtime.get("base_url"), "api_key": runtime.get("api_key"),
                 "credential_pool": runtime.get("credential_pool"),
                 "command": runtime.get("command"), "args": list(runtime.get("args") or []),

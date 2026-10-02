@@ -155,6 +155,13 @@ Credential resolution for native Anthropic now prefers refreshable Claude Code c
 
 ## OpenAI Codex path
 
+ACP sessions preserve the resolved `requested_provider` identity separately from the normalized
+`provider` billing class. A named custom provider therefore keeps its identity through agent
+construction, native save, restore, fork and the model picker. Older sessions without that
+identity are not assumed to match a newly selected provider; their old endpoint and wire mode
+cannot override the new provider's resolved route. A known same-provider selection retains its
+explicit session endpoint and wire-mode override.
+
 Codex uses a separate Responses API path:
 
 - `api_mode = codex_responses`
