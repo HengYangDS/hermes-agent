@@ -164,6 +164,8 @@ Instead it reuses Hermes' runtime resolver:
 
 So ACP advertises and uses the currently configured Hermes provider/credentials. It also always advertises a terminal setup auth method (`hermes-setup`, args `--setup`) so first-run ACP clients can open Hermes' interactive model/provider configuration before starting a normal ACP session.
 
+A named custom provider (`custom:<name>`) resolves to the runtime class `custom`. Sessions keep the selected identity as the agent's `requested_provider`, so it survives save, restore, fork, the model picker, `/model` and model switches. A session row from before this keeps restoring from its saved `provider`.
+
 ## Working directory binding
 
 ACP sessions carry an editor cwd.

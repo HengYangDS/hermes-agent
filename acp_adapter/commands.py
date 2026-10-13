@@ -9,7 +9,7 @@ from typing import Any
 
 from acp.schema import AvailableCommand, AvailableCommandsUpdate, UnstructuredCommandInput
 
-from acp_adapter.session import SessionState, _expand_acp_enabled_toolsets
+from acp_adapter.session import SessionState, _expand_acp_enabled_toolsets, agent_provider_identity
 
 logger = logging.getLogger("acp_adapter.server")
 
@@ -139,11 +139,11 @@ class SlashCommandsMixin:
     def _cmd_model(self, args: str, state: SessionState) -> str:
         if not args:
             model = state.model or getattr(state.agent, "model", "unknown")
-            provider = getattr(state.agent, "provider", None) or "auto"
+            provider = agent_provider_identity(state.agent) or "auto"
             return f"Current model: {model}\nProvider: {provider}"
 
         current_provider, target_provider, new_model = self._switch_model(state, args)
-        provider_label = getattr(state.agent, "provider", None) or target_provider or current_provider or "openrouter"
+        provider_label = agent_provider_identity(state.agent) or target_provider or current_provider or "openrouter"
         logger.info("Session %s: model switched to %s", state.session_id, new_model)
         return f"Model switched to: {new_model}\nProvider: {provider_label}"
 
@@ -188,7 +188,7 @@ class SlashCommandsMixin:
 
         agent = state.agent
         model = state.model or getattr(agent, "model", "")
-        provider = getattr(agent, "provider", None) or "auto"
+        provider = agent_provider_identity(agent) or "auto"
         compressor = getattr(agent, "context_compressor", None)
         context_length = int(getattr(compressor, "context_length", 0) or 0)
         threshold_tokens = int(getattr(compressor, "threshold_tokens", 0) or 0)
